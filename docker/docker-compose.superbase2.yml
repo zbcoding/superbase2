@@ -1,0 +1,40 @@
+# SuperBase² — multi-project overlay for self-hosted Supabase.
+#
+# For Coolify / single-file deployment:
+#   docker compose -f docker-compose.yml -f docker-compose.superbase2.yml up -d
+#
+# This overlay:
+# 1. Enables SuperBase² in Studio so the middleware activates
+# 2. Bind-mounts the shared projects manifest so CLI and Studio read/write the same file
+# 3. Adds an init container that ensures the manifest file exists on the host
+
+services:
+  studio:
+    depends_on:
+      superbase2-init:
+        condition: service_completed_successfully
+    environment:
+      SUPERBASE2_ENABLED: "true"
+      SUPERBASE2_MANIFEST: /etc/superbase2/projects.json
+    volumes:
+      - ${SUPERBASE2_DIR:-./superbase2}/projects.json:/etc/superbase2/projects.json:z
+
+  # One-shot init container that ensures the manifest file exists on the host.
+  # Uses the same bind mount so the file is created on the host filesystem,
+  # keeping CLI (superbase2.sh) and Studio in sync.
+  superbase2-init:
+    image: alpine:3.19
+    restart: "no"
+    volumes:
+      - ${SUPERBASE2_DIR:-./superbase2}/projects.json:/etc/superbase2/projects.json:z
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        if [ ! -s /etc/superbase2/projects.json ]; then
+          echo '{ "projects": [] }' > /etc/superbase2/projects.json
+          echo "[SuperBase²] Initialized empty projects manifest"
+        else
+          echo "[SuperBase²] Projects manifest already exists"
+        fi
+        chmod 600 /etc/superbase2/projects.json
