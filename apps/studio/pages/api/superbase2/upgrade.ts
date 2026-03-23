@@ -15,9 +15,10 @@ import { isSuperBase2Enabled } from 'lib/superbase2/projects'
 
 interface ImageStatus {
   service: string
-  current: string
+  current: string | null
   latest: string | null
   updateAvailable: boolean
+  error?: string
 }
 
 const COMPOSE_PATH =
@@ -104,9 +105,12 @@ function compareSemver(a: string, b: string): number {
 }
 
 async function fetchLatestTag(image: string): Promise<string | null> {
+  // Strip digest suffix (e.g. "@sha256:abc") before splitting on ':',
+  // otherwise the repo portion becomes "org/name@sha256" which is an invalid API path.
+  const imageWithoutDigest = image.split('@')[0]
   // Extract org/repo and current tag prefix from image string
   // e.g. "supabase/gotrue:v2.186.0" → repo="supabase/gotrue", prefix="v"
-  const [repo, currentTag] = image.split(':')
+  const [repo, currentTag] = imageWithoutDigest.split(':')
   const prefix = currentTag?.match(/^(v?)\d/)?.[1] || ''
 
   try {
@@ -116,11 +120,15 @@ async function fetchLatestTag(image: string): Promise<string | null> {
       { signal: AbortSignal.timeout(5000) }
     )
 
+    if (res.status === 429) throw new Error('rate-limited')
     if (!res.ok) return null
 
     const data = await res.json()
-    const tags: { name: string }[] = data.results
-    if (!Array.isArray(tags) || tags.length === 0) return null
+    if (!data || !Array.isArray(data.results)) return null
+    const tags: { name: string }[] = (data.results as unknown[]).filter(
+      (t): t is { name: string } => t !== null && typeof t === 'object' && typeof (t as any).name === 'string'
+    )
+    if (tags.length === 0) return null
 
     // Filter to version-like tags matching the same prefix pattern.
     // Accepts semver (v1.2.3), CalVer (2026.02.16), and SHA-suffixed tags (2026.02.16-sha-xxx).
@@ -137,7 +145,8 @@ async function fetchLatestTag(image: string): Promise<string | null> {
     // Find the highest version
     semverTags.sort((a, b) => compareSemver(b.version, a.version))
     return `${repo}:${semverTags[0].full}`
-  } catch {
+  } catch (err) {
+    if (err instanceof Error && err.message === 'rate-limited') throw err
     return null
   }
 }
@@ -153,11 +162,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(405).json({ error: { message: `Method ${req.method} Not Allowed` } })
   }
 
-  // Validate compose path doesn't escape expected directory
-  const composePath = path.resolve(COMPOSE_PATH)
-  if (composePath.includes('..')) {
+  // Validate the raw path before resolving — path.resolve() produces an absolute
+  // path that never contains '..', so the check must happen before resolution.
+  if (COMPOSE_PATH.includes('..')) {
     return res.status(500).json({ error: { message: 'Invalid compose file path' } })
   }
+  const composePath = path.resolve(COMPOSE_PATH)
 
   const currentImages = parseComposeImages(composePath)
 
@@ -170,8 +180,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   // Check all images in parallel
   const results: ImageStatus[] = await Promise.all(
     Object.entries(currentImages).map(async ([service, currentImage]) => {
-      const latest = await fetchLatestTag(currentImage)
-      const currentTag = currentImage.split(':')[1]
+      const currentTag = currentImage.split(':')[1] ?? null
+      let latest: string | null = null
+      let error: string | undefined
+
+      try {
+        latest = await fetchLatestTag(currentImage)
+      } catch (err: unknown) {
+        error = err instanceof Error && err.message === 'rate-limited'
+          ? 'Docker Hub rate limit reached — try again later'
+          : 'Failed to fetch latest tag'
+      }
+
       const latestTag = latest?.split(':')[1] ?? null
 
       // Compare version cores (strip SHA suffix) to avoid false positives
@@ -183,7 +203,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         service,
         current: currentTag,
         latest: latestTag,
-        updateAvailable: latestTag !== null && latestCore !== currentCore && compareSemver(latestCore, currentCore) > 0,
+        updateAvailable: currentTag !== null && latestTag !== null && latestCore !== currentCore && compareSemver(latestCore, currentCore) > 0,
+        ...(error && { error }),
       }
     })
   )
@@ -196,8 +217,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     upgradeInstructions: hasUpdates
       ? [
           'git pull upstream master',
-          'docker compose -f docker-compose.coolify.yml pull',
-          'docker compose -f docker-compose.coolify.yml up -d',
+          `docker compose -f ${path.basename(composePath)} pull`,
+          `docker compose -f ${path.basename(composePath)} up -d`,
         ]
       : null,
   })

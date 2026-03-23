@@ -210,11 +210,13 @@ list_projects() {
 cmd_create() {
     local name="$1"
 
-    # Validate project name: only alphanumeric and underscores; 2-48 chars
-    # No hyphens — they cause DB name collisions ("my-app" and "my_app" both → project_my_app)
-    if [[ ! "$name" =~ ^[a-zA-Z0-9_]+$ ]]; then
+    # Validate project name: only alphanumeric; 2-48 chars.
+    # No underscores — Docker DNS does not support them in service hostnames (RFC 1123),
+    # which would break per-project container resolution (e.g. meta-<name>).
+    # No hyphens — reserved for future use and avoided for DB name safety.
+    if [[ ! "$name" =~ ^[a-zA-Z0-9]+$ ]]; then
         echo "Error: Invalid project name '$name'."
-        echo "Project names may only contain letters, numbers, and underscores."
+        echo "Project names may only contain letters and numbers (no underscores or hyphens)."
         exit 1
     fi
 
@@ -268,7 +270,7 @@ EOFUNC
     s3_access_key_id=$(gen_hex 16)
     local s3_access_key_secret
     s3_access_key_secret=$(gen_hex 32)
-    local db_name="project_${name//-/_}"
+    local db_name="project_${name}"
 
     # Write project .env
     cat > "$project_dir/.env" <<EOF

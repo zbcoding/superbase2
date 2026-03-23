@@ -19,8 +19,14 @@ function getDbVersion(): string {
 
 /** Clamp pagination params to safe ranges. */
 export function clampPagination(req: NextApiRequest, defaults: { limit: number; offset: number } = { limit: 100, offset: 0 }) {
-  const limit = Math.min(Math.max(parseInt((req.query.limit as string) || String(defaults.limit), 10) || defaults.limit, 1), 500)
-  const offset = Math.max(parseInt((req.query.offset as string) || String(defaults.offset), 10) || 0, 0)
+  // Next.js can parse repeated query params as string[], pick the first element.
+  const limitStr = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit
+  const offsetStr = Array.isArray(req.query.offset) ? req.query.offset[0] : req.query.offset
+  // Use ?? instead of || so that an explicit limit=0 is clamped to 1 rather than
+  // falling back to the default (parseInt("0") is 0, which is falsy with ||).
+  const parsedLimit = parseInt(limitStr ?? String(defaults.limit), 10)
+  const limit = Math.min(Math.max(Number.isFinite(parsedLimit) ? parsedLimit : defaults.limit, 1), 500)
+  const offset = Math.max(parseInt(offsetStr || String(defaults.offset), 10) || 0, 0)
   return { limit, offset }
 }
 
@@ -76,7 +82,7 @@ export function toDatabasesResponse(p: MultiProject) {
   const publicUrl = getPublicUrl()
   return [
     {
-      cloud_provider: 'localhost' as any,
+      cloud_provider: 'localhost' as string,
       connectionString: '',
       connection_string_read_only: '',
       db_host: process.env.POSTGRES_HOST || 'db',
@@ -94,9 +100,8 @@ export function toDatabasesResponse(p: MultiProject) {
 }
 
 /** Shape expected by GET /platform/projects/{ref}/settings.
- *  Anon key is included (needed by Studio for client-side operations).
- *  Service role key and JWT secret are redacted on read — only
- *  returned at creation time via toCreationResponse(). */
+ *  Includes jwt_secret and service_role_key — Studio needs these to configure
+ *  PostgREST and display API settings. Only call from authenticated API routes. */
 export function toSettingsResponse(p: MultiProject) {
   const publicUrl = getPublicUrl()
   return {
@@ -153,7 +158,9 @@ export function toPostgrestConfigResponse(p: MultiProject) {
     db_extra_search_path: process.env.PGRST_DB_EXTRA_SEARCH_PATH ?? 'public',
     db_schema: process.env.PGRST_DB_SCHEMAS ?? 'public,storage,graphql_public',
     jwt_secret: p.jwt_secret,
-    max_rows: Number(process.env.PGRST_DB_MAX_ROWS) || 1000,
+    max_rows: process.env.PGRST_DB_MAX_ROWS !== undefined
+      ? (parseInt(process.env.PGRST_DB_MAX_ROWS, 10) || 1000)
+      : 1000,
     role_claim_key: '.role',
   }
 }

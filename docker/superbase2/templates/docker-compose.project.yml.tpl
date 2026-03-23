@@ -5,7 +5,7 @@ services:
 
   auth-{{PROJECT_NAME}}:
     container_name: supabase-{{PROJECT_NAME}}-auth
-    image: supabase/gotrue:v2.186.0
+    image: supabase/gotrue:${GOTRUE_VERSION:-v2.186.0}
     restart: unless-stopped
     networks:
       - supabase_default
@@ -60,15 +60,15 @@ services:
 
   rest-{{PROJECT_NAME}}:
     container_name: supabase-{{PROJECT_NAME}}-rest
-    image: postgrest/postgrest:v14.5
+    image: postgrest/postgrest:${POSTGREST_VERSION:-v14.5}
     restart: unless-stopped
     networks:
       - supabase_default
     environment:
       PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/{{PROJECT_DB}}
-      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS}
-      PGRST_DB_MAX_ROWS: ${PGRST_DB_MAX_ROWS}
-      PGRST_DB_EXTRA_SEARCH_PATH: ${PGRST_DB_EXTRA_SEARCH_PATH}
+      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS:-public,storage,graphql_public}
+      PGRST_DB_MAX_ROWS: ${PGRST_DB_MAX_ROWS:-1000}
+      PGRST_DB_EXTRA_SEARCH_PATH: ${PGRST_DB_EXTRA_SEARCH_PATH:-public}
       PGRST_DB_ANON_ROLE: anon
       PGRST_JWT_SECRET: ${PROJECT_JWT_SECRET}
       PGRST_DB_USE_LEGACY_GUCS: "false"
@@ -82,7 +82,7 @@ services:
   realtime-{{PROJECT_NAME}}:
     # Container name includes tenant ID — Realtime parses subdomain for tenant
     container_name: realtime-{{PROJECT_NAME}}.supabase-realtime
-    image: supabase/realtime:v2.76.5
+    image: supabase/realtime:${REALTIME_VERSION:-v2.76.5}
     restart: unless-stopped
     networks:
       - supabase_default
@@ -102,9 +102,9 @@ services:
       DB_PORT: ${POSTGRES_PORT}
       DB_USER: supabase_admin
       DB_PASSWORD: ${POSTGRES_PASSWORD}
-      DB_NAME: {{PROJECT_DB}}
+      DB_NAME: "{{PROJECT_DB}}"
       DB_AFTER_CONNECT_QUERY: 'SET search_path TO _realtime'
-      DB_ENC_KEY: supabaserealtime
+      DB_ENC_KEY: ${PROJECT_SECRET_KEY_BASE}
       API_JWT_SECRET: ${PROJECT_JWT_SECRET}
       SECRET_KEY_BASE: ${PROJECT_SECRET_KEY_BASE}
       ERL_AFLAGS: -proto_dist inet_tcp
@@ -117,7 +117,7 @@ services:
 
   storage-{{PROJECT_NAME}}:
     container_name: supabase-{{PROJECT_NAME}}-storage
-    image: supabase/storage-api:v1.37.8
+    image: supabase/storage-api:${STORAGE_VERSION:-v1.37.8}
     restart: unless-stopped
     networks:
       - supabase_default
@@ -143,10 +143,10 @@ services:
       REQUEST_ALLOW_X_FORWARDED_PATH: "true"
       FILE_SIZE_LIMIT: 52428800
       STORAGE_BACKEND: file
-      GLOBAL_S3_BUCKET: ${GLOBAL_S3_BUCKET}
+      GLOBAL_S3_BUCKET: ${GLOBAL_S3_BUCKET:-stub}
       FILE_STORAGE_BACKEND_PATH: /var/lib/storage
-      TENANT_ID: ${STORAGE_TENANT_ID}
-      REGION: ${REGION}
+      TENANT_ID: ${STORAGE_TENANT_ID:-{{PROJECT_NAME}}}
+      REGION: ${REGION:-local}
       ENABLE_IMAGE_TRANSFORMATION: "true"
       IMGPROXY_URL: http://supabase-imgproxy:5001
       S3_PROTOCOL_ACCESS_KEY_ID: ${PROJECT_S3_ACCESS_KEY_ID}
@@ -156,7 +156,7 @@ services:
 
   meta-{{PROJECT_NAME}}:
     container_name: supabase-{{PROJECT_NAME}}-meta
-    image: supabase/postgres-meta:v0.95.2
+    image: supabase/postgres-meta:${POSTGRES_META_VERSION:-v0.95.2}
     restart: unless-stopped
     networks:
       - supabase_default
@@ -164,19 +164,19 @@ services:
       PG_META_PORT: 8080
       PG_META_DB_HOST: ${POSTGRES_HOST}
       PG_META_DB_PORT: ${POSTGRES_PORT}
-      PG_META_DB_NAME: {{PROJECT_DB}}
+      PG_META_DB_NAME: "{{PROJECT_DB}}"
       PG_META_DB_USER: supabase_admin
       PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
       CRYPTO_KEY: ${PROJECT_PG_META_CRYPTO_KEY}
 
   functions-{{PROJECT_NAME}}:
     container_name: supabase-{{PROJECT_NAME}}-functions
-    image: supabase/edge-runtime:v1.70.3
+    image: supabase/edge-runtime:${EDGE_RUNTIME_VERSION:-v1.70.3}
     restart: unless-stopped
     networks:
       - supabase_default
     volumes:
-      - ./volumes/functions:/home/deno/functions:Z
+      - ./volumes/functions-{{PROJECT_NAME}}:/home/deno/functions:Z
     environment:
       JWT_SECRET: ${PROJECT_JWT_SECRET}
       SUPABASE_URL: http://supabase-kong:8000

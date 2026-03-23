@@ -77,8 +77,10 @@ function tryAcquireLock(retries: number = 1): boolean {
         // two processes both detect the same stale lock and one deletes a fresh lock.
         const stalePath = `${LOCK_PATH}.stale.${process.pid}`
         try {
+          // Rename to a unique PID-scoped name before deleting so two
+          // processes racing on the same stale lock each get their own copy.
           fs.renameSync(LOCK_PATH, stalePath)
-          fs.unlinkSync(stalePath)
+          fs.rmSync(stalePath, { force: true })
         } catch {
           // Another process beat us to it — fine, just retry
         }
@@ -211,6 +213,11 @@ export async function updateProjectName(ref: string, newName: string): Promise<b
     if (manifest.projects.some((p) => p.ref !== ref && p.name === newName)) {
       return { manifest, result: false }
     }
+    // NOTE: project.db (e.g. "project_oldname") is intentionally NOT updated here.
+    // Renaming a live Postgres database requires terminating all connections and
+    // running ALTER DATABASE ... RENAME TO, which must be done via the shell script
+    // (superbase2.sh rename). The manifest db field stays as the authoritative DB
+    // identifier; project.name is purely a display label after creation.
     project.name = newName
     return { manifest, result: true }
   })

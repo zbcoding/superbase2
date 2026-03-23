@@ -51,13 +51,7 @@ function getCsrfToken(): string {
 
 function copyToClipboard(text: string) {
   navigator.clipboard.writeText(text).catch(() => {
-    // Fallback for older browsers
-    const el = document.createElement('textarea')
-    el.value = text
-    document.body.appendChild(el)
-    el.select()
-    document.execCommand('copy')
-    document.body.removeChild(el)
+    // clipboard API unavailable (e.g. non-HTTPS context)
   })
 }
 
@@ -79,22 +73,34 @@ export default function SB2Dashboard() {
   const [serviceChanged, setServiceChanged] = useState<string | null>(null)
 
   useEffect(() => {
+    const controller = new AbortController()
+    const { signal } = controller
+    const timeoutId = setTimeout(() => controller.abort(), 10_000)
+
     Promise.all([
-      fetch('/api/superbase2/projects')
+      fetch('/api/superbase2/projects', { signal })
         .then((r) => {
           if (!r.ok) throw new Error(`Failed to fetch projects: ${r.status}`)
           return r.json()
         })
         .then((data) => setProjects(Array.isArray(data) ? data : []))
-        .catch((err) => setError(err.message)),
-      fetch('/api/superbase2/upgrade')
+        .catch((err) => { if (err.name !== 'AbortError') setError(err.message) }),
+      fetch('/api/superbase2/upgrade', { signal })
         .then((r) => {
           if (!r.ok) return null
           return r.json()
         })
         .then((data) => setUpgrade(data))
         .catch(() => null),
-    ]).finally(() => setLoading(false))
+    ]).finally(() => {
+      clearTimeout(timeoutId)
+      setLoading(false)
+    })
+
+    return () => {
+      clearTimeout(timeoutId)
+      controller.abort()
+    }
   }, [])
 
   const filteredProjects = useMemo(() => {
@@ -133,12 +139,16 @@ export default function SB2Dashboard() {
         },
         body: JSON.stringify({ name: newName.trim() }),
       })
-      const data = await res.json()
 
       if (!res.ok) {
-        setError(data.error?.message || 'Failed to create project')
+        let message = 'Failed to create project'
+        try { message = (await res.json()).error?.message || message } catch {}
+        if (res.status === 403) message += ' — refresh the page and try again.'
+        setError(message)
         return
       }
+
+      const data = await res.json()
 
       setProjects((prev) => [...prev, data])
       setNewName('')
@@ -166,8 +176,10 @@ export default function SB2Dashboard() {
         headers: { 'X-SB2-CSRF': getCsrfToken() },
       })
       if (!res.ok) {
-        const data = await res.json()
-        setError(data.error?.message || 'Failed to delete project')
+        let message = 'Failed to delete project'
+        try { message = (await res.json()).error?.message || message } catch {}
+        if (res.status === 403) message += ' — refresh the page and try again.'
+        setError(message)
         return
       }
       setProjects((prev) => prev.filter((p) => p.ref !== ref))
@@ -348,10 +360,10 @@ export default function SB2Dashboard() {
                 id="sb2-project-name"
                 type="text"
                 value={newName}
-                onChange={(e) => setNewName(e.target.value.replace(/[^a-zA-Z0-9_]/g, ''))}
-                placeholder="Project name (letters, numbers, underscores)"
-                pattern="^[a-zA-Z0-9_]{2,48}$"
-                title="Only letters, numbers, and underscores (2-48 chars). No hyphens."
+                onChange={(e) => setNewName(e.target.value.replace(/[^a-zA-Z0-9]/g, ''))}
+                placeholder="Project name (letters and numbers only)"
+                pattern="^[a-zA-Z0-9]{2,48}$"
+                title="Only letters and numbers (2-48 chars). No hyphens or underscores."
                 style={styles.input}
                 disabled={creating}
                 minLength={2}
@@ -364,7 +376,7 @@ export default function SB2Dashboard() {
             </form>
             {error && <p style={styles.error} role="alert" aria-live="polite">{error}</p>}
             <p id="sb2-project-hint" style={styles.hint}>
-              Creates the database and secrets. Only letters, numbers, and underscores allowed. Run{' '}
+              Creates the database and secrets. Only letters and numbers allowed (no underscores or hyphens — required for Docker DNS). Run{' '}
               <code style={styles.code}>./superbase2.sh up {'<name>'}</code> on the server to start
               the per-project containers.
             </p>

@@ -16,21 +16,27 @@ import { Pool } from 'pg'
 // Module-level pool reused across calls. Lazily created on first use.
 let _adminPool: Pool | null = null
 
-// Clean up pool on process shutdown to avoid lingering connections
-for (const signal of ['SIGTERM', 'SIGINT'] as const) {
-  process.on(signal, () => {
-    if (_adminPool) {
-      _adminPool.end().catch(() => {})
-      _adminPool = null
-    }
-  })
+// Clean up pool on process shutdown to avoid lingering connections.
+// Use global to survive Next.js hot-reload module re-evaluation — a plain
+// module-level `let` resets to false each time the module is re-required.
+const _g = global as typeof global & { _sb2SignalsRegistered?: boolean }
+if (!_g._sb2SignalsRegistered) {
+  _g._sb2SignalsRegistered = true
+  for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+    process.on(signal, () => {
+      if (_adminPool) {
+        _adminPool.end().catch(() => {})
+        _adminPool = null
+      }
+    })
+  }
 }
 
 function getAdminPool(): Pool {
+  if (!process.env.POSTGRES_PASSWORD) {
+    throw new Error('[SuperBase²] POSTGRES_PASSWORD environment variable is required')
+  }
   if (!_adminPool) {
-    if (!process.env.POSTGRES_PASSWORD) {
-      throw new Error('POSTGRES_PASSWORD environment variable is required for SuperBase²')
-    }
     _adminPool = new Pool({
       host: process.env.POSTGRES_HOST || 'db',
       port: parseInt(process.env.POSTGRES_PORT || '5432', 10),
@@ -99,10 +105,13 @@ export async function createProjectDatabase(
       if (!/^[A-Za-z0-9+/=]+$/.test(jwtSecret)) {
         throw new Error('Invalid JWT secret: must be base64-encoded')
       }
-      const safeJwtSecret = jwtSecret.replace(/'/g, "''")
+      // Use dollar-quoting for DDL string literals — base64 alphabet ([A-Za-z0-9+/=])
+      // cannot contain '$', so the $sb2$ delimiter can never appear in the value.
+      // This prevents injection even if the regex check above were somehow bypassed.
       await client.query(
-        `ALTER DATABASE "${safeName}" SET "app.settings.jwt_secret" TO '${safeJwtSecret}'`
+        `ALTER DATABASE "${safeName}" SET "app.settings.jwt_secret" TO $sb2$${jwtSecret}$sb2$`
       )
+      // jwtExp is already validated as numeric-only above, so interpolation is safe.
       await client.query(
         `ALTER DATABASE "${safeName}" SET "app.settings.jwt_exp" TO '${jwtExp}'`
       )
@@ -167,12 +176,12 @@ export async function createProjectDatabase(
 }
 
 /** Validate that a project name is safe for use in identifiers and file paths.
- *  Only alphanumeric + underscores allowed — no hyphens.
- *  This must match createProjectDatabase/dropProjectDatabase validation
- *  to prevent collisions (e.g. "my-app" and "my_app" → same DB name).
+ *  Only alphanumeric characters allowed — no hyphens, no underscores.
+ *  Underscores are excluded because Docker DNS does not support them in hostnames
+ *  (RFC 1123), which would break per-project container resolution (e.g. meta-<name>).
  *  Keep in sync with superbase2.sh cmd_create validation. */
 export function isValidProjectName(name: string): boolean {
-  return /^[a-zA-Z0-9_]+$/.test(name) && name.length >= 2 && name.length <= MAX_PROJECT_NAME_LENGTH
+  return /^[a-zA-Z0-9]+$/.test(name) && name.length >= 2 && name.length <= MAX_PROJECT_NAME_LENGTH
 }
 
 export async function dropProjectDatabase(dbName: string): Promise<void> {

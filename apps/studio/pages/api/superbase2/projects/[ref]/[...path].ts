@@ -1,4 +1,5 @@
 import crypto from 'crypto'
+import path from 'path'
 import type { NextApiRequest, NextApiResponse } from 'next'
 
 import { requireAuth, checkCsrf } from 'lib/superbase2/auth'
@@ -131,10 +132,22 @@ async function proxyPgMeta(
   subPath: string
 ) {
   const metaPath = subPath.replace(/^pg\/?/, '')
-  const metaHost = `meta-${project.name}`
+  // Lowercase the hostname: URL normalizes to lowercase, so the equality check
+  // on line 155 would always fail for project names with uppercase letters.
+  const metaHost = `meta-${project.name}`.toLowerCase()
 
-  // Reject path traversal attempts
-  if (metaPath.includes('..') || metaPath.includes('//')) {
+  // Reject path traversal attempts — check both the raw path and URL-decoded
+  // variants (%2e%2e, %2f%2f, etc.) that could bypass a plain string check.
+  const decodedMetaPath = (() => {
+    try { return decodeURIComponent(metaPath) } catch { return metaPath }
+  })()
+  const normalizedPath = path.posix.normalize(decodedMetaPath)
+  if (
+    metaPath.includes('..') ||
+    metaPath.includes('//') ||
+    decodedMetaPath.includes('..') ||
+    normalizedPath.startsWith('..')
+  ) {
     return res.status(400).json({ error: { message: 'Invalid path' } })
   }
 
@@ -145,8 +158,14 @@ async function proxyPgMeta(
     return res.status(400).json({ error: { message: 'Invalid proxy target' } })
   }
   for (const [key, value] of Object.entries(req.query)) {
-    if (key !== 'ref' && key !== 'path' && typeof value === 'string') {
+    if (key === 'ref' || key === 'path') continue
+    if (typeof value === 'string') {
       metaUrl.searchParams.set(key, value)
+    } else if (Array.isArray(value)) {
+      // Forward repeated query params (e.g. ?foo=a&foo=b) as multiple values
+      for (const v of value) {
+        metaUrl.searchParams.append(key, v)
+      }
     }
   }
 
@@ -162,14 +181,20 @@ async function proxyPgMeta(
       proxyHeaders['x-connection-encrypted'] = req.headers['x-connection-encrypted'] as string
     }
 
+    const proxyTimeoutMs = parseInt(process.env.SUPERBASE2_PROXY_TIMEOUT_MS || '15000', 10)
     const fetchOpts: RequestInit = {
       method: req.method,
       headers: proxyHeaders,
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.timeout(proxyTimeoutMs),
     }
 
     if (req.method !== 'GET' && req.method !== 'HEAD' && req.body) {
-      fetchOpts.body = JSON.stringify(req.body)
+      const contentType = (req.headers['content-type'] as string) || ''
+      // Only JSON-stringify when the client sent JSON — Next.js has already parsed it
+      // into req.body. For other content types pass the raw body through unchanged.
+      fetchOpts.body = contentType.includes('application/json')
+        ? JSON.stringify(req.body)
+        : (req.body as BodyInit)
     }
 
     const proxyRes = await fetch(metaUrl.toString(), fetchOpts)
@@ -183,12 +208,16 @@ async function proxyPgMeta(
       return res.status(proxyRes.status).send(text)
     }
   } catch (err: unknown) {
-    // Container not running or unreachable
     console.error(`pg-meta proxy error for project '${project.name}':`, err)
+    // Distinguish timeout from connection refused so callers can act accordingly.
+    const isTimeout = err instanceof Error && err.name === 'TimeoutError'
+    if (isTimeout) {
+      return res.status(504).json({
+        error: { message: 'pg-meta request timed out. The container may be overloaded.' },
+      })
+    }
     return res.status(503).json({
-      error: {
-        message: 'pg-meta is not reachable. Ensure per-project containers are running.',
-      },
+      error: { message: 'pg-meta is not reachable. Ensure per-project containers are running.' },
     })
   }
 }

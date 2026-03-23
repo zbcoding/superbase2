@@ -47,13 +47,19 @@ export function requireAuth(req: NextApiRequest, res: NextApiResponse): boolean 
   const user = decoded.slice(0, colonIndex)
   const pass = decoded.slice(colonIndex + 1)
 
-  // Constant-time comparison to prevent timing attacks
+  // Constant-time comparison to prevent timing attacks.
+  // Use byte length (UTF-8) for the pre-check, not JS string length, so that
+  // multibyte characters don't cause timingSafeEqual to throw on length mismatch.
+  const userBuf = Buffer.from(user)
+  const expectedUserBuf = Buffer.from(expectedUser)
+  const passBuf = Buffer.from(pass)
+  const expectedPassBuf = Buffer.from(expectedPass)
   const userMatch =
-    user.length === expectedUser.length &&
-    crypto.timingSafeEqual(Buffer.from(user), Buffer.from(expectedUser))
+    userBuf.length === expectedUserBuf.length &&
+    crypto.timingSafeEqual(userBuf, expectedUserBuf)
   const passMatch =
-    pass.length === expectedPass.length &&
-    crypto.timingSafeEqual(Buffer.from(pass), Buffer.from(expectedPass))
+    passBuf.length === expectedPassBuf.length &&
+    crypto.timingSafeEqual(passBuf, expectedPassBuf)
 
   if (!userMatch || !passMatch) {
     res.status(401).json({ error: { message: 'Invalid credentials' } })
@@ -83,9 +89,17 @@ export function checkCsrf(req: NextApiRequest, res: NextApiResponse): boolean {
   // Set CSRF cookie if not present
   if (!csrfCookie) {
     const token = crypto.randomBytes(32).toString('hex')
+    // NOTE: intentionally NOT HttpOnly — the double-submit cookie pattern requires
+    // client JS to read this cookie and echo it back in the X-SB2-CSRF header.
+    // SameSite=Strict prevents cross-origin requests from carrying the cookie at all,
+    // which is the primary CSRF defense. HttpOnly would make the header unreadable
+    // by the browser and break all mutating requests from the /sb2 dashboard.
+    const isHttps =
+      process.env.NODE_ENV === 'production' ||
+      req.headers['x-forwarded-proto'] === 'https'
     res.setHeader(
       'Set-Cookie',
-      `sb2_csrf=${token}; Path=/api/superbase2; HttpOnly; SameSite=Strict; Max-Age=86400`
+      `sb2_csrf=${token}; Path=/; SameSite=Strict; Max-Age=86400${isHttps ? '; Secure' : ''}`
     )
     // For safe methods, proceed even without token (it's being set now)
     if (safeMethods.has(req.method || '')) return true
@@ -97,9 +111,14 @@ export function checkCsrf(req: NextApiRequest, res: NextApiResponse): boolean {
   // Safe methods are always allowed
   if (safeMethods.has(req.method || '')) return true
 
-  // Mutating methods must include X-SB2-CSRF header matching the cookie
+  // Mutating methods must include X-SB2-CSRF header matching the cookie.
+  // Use constant-time comparison to prevent timing attacks on the token.
   const csrfHeader = req.headers['x-sb2-csrf'] as string | undefined
-  if (!csrfHeader || csrfHeader !== csrfCookie) {
+  const headerBuf = Buffer.from(csrfHeader || '')
+  const cookieBuf = Buffer.from(csrfCookie)
+  const csrfMatch =
+    headerBuf.length === cookieBuf.length && crypto.timingSafeEqual(headerBuf, cookieBuf)
+  if (!csrfHeader || !csrfMatch) {
     res.status(403).json({ error: { message: 'CSRF token mismatch' } })
     return false
   }
@@ -108,6 +127,8 @@ export function checkCsrf(req: NextApiRequest, res: NextApiResponse): boolean {
 }
 
 function parseCookie(cookieHeader: string, name: string): string | undefined {
-  const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`))
+  // Escape regex metacharacters in the cookie name to prevent injection.
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${escapedName}=([^;]+)`))
   return match?.[1]
 }
