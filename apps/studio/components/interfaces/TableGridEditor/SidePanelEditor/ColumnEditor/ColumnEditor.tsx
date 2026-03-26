@@ -50,7 +50,7 @@ import {
 } from './ColumnEditor.utils'
 import ColumnForeignKey from './ColumnForeignKey'
 import ColumnType from './ColumnType'
-import HeaderTitle from './HeaderTitle'
+import { HeaderTitle } from './HeaderTitle'
 
 export interface ColumnEditorProps {
   column?: Readonly<PostgresColumn>
@@ -364,6 +364,7 @@ export const ColumnEditor = ({
       >
         <FormSectionContent loading={false} className="lg:!col-span-8">
           <ColumnForeignKey
+            tableId={selectedTable.id}
             column={columnFields}
             relations={fkRelations}
             closePanel={closePanel}
