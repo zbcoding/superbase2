@@ -22,7 +22,7 @@ interface ImageStatus {
 }
 
 const COMPOSE_PATH =
-  process.env.SUPERBASE2_COMPOSE_FILE || '/etc/superbase2/docker-compose.coolify.yml'
+  process.env.SUPERBASE2_COMPOSE_FILE || '/etc/superbase2/docker-compose.yml'
 
 // Services to skip when checking for updates (not real Supabase services)
 const SKIP_SERVICES = new Set(['superbase2-init'])
@@ -168,6 +168,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(500).json({ error: { message: 'Invalid compose file path' } })
   }
   const composePath = path.resolve(COMPOSE_PATH)
+  const composeCmd = process.env.SUPERBASE2_COMPOSE_CMD ||
+    'docker compose -f docker-compose.yml -f docker-compose.superbase2.yml'
 
   const currentImages = parseComposeImages(composePath)
 
@@ -217,8 +219,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     upgradeInstructions: hasUpdates
       ? [
           'git pull upstream master',
-          `docker compose -f ${path.basename(composePath)} pull`,
-          `docker compose -f ${path.basename(composePath)} up -d`,
+          `${composeCmd} pull`,
+          `${composeCmd} up -d`,
         ]
       : null,
   })

@@ -1,23 +1,40 @@
 # SuperBase² — multi-project overlay for self-hosted Supabase.
 #
-# For Coolify / single-file deployment:
+# Apply on top of the unmodified upstream docker-compose.yml:
+#   cd docker/
 #   docker compose -f docker-compose.yml -f docker-compose.superbase2.yml up -d
 #
+# On Coolify: set the custom start command to the line above (base directory: docker/).
+# This keeps docker-compose.yml 100% unmodified upstream — only this file changes.
+#
 # This overlay:
-# 1. Enables SuperBase² in Studio so the middleware activates
-# 2. Bind-mounts the shared projects manifest so CLI and Studio read/write the same file
-# 3. Adds an init container that ensures the manifest file exists on the host
+# 1. Builds the Studio from this repo's source so SuperBase² API routes are included
+#    (the upstream supabase/studio image does not have them — it cannot be used as-is)
+# 2. Enables SuperBase² in Studio so the middleware activates
+# 3. Bind-mounts the shared projects manifest so the CLI and Studio share state
+# 4. Adds a one-shot init container that ensures the manifest file exists on first boot
+#
+# The build context is the monorepo root (one level up from docker/).
+# After code changes: docker compose -f docker-compose.yml -f docker-compose.superbase2.yml build studio
 
 services:
   studio:
+    build:
+      context: ..
+      dockerfile: apps/studio/Dockerfile
+      target: production
+    image: supabase/studio:superbase2-local
     depends_on:
       superbase2-init:
         condition: service_completed_successfully
     environment:
       SUPERBASE2_ENABLED: "true"
       SUPERBASE2_MANIFEST: /etc/superbase2/projects.json
+      SUPERBASE2_COMPOSE_FILE: /etc/superbase2/docker-compose.yml
+      SUPERBASE2_COMPOSE_CMD: "docker compose -f docker-compose.yml -f docker-compose.superbase2.yml"
     volumes:
       - ${SUPERBASE2_DIR:-./superbase2}/projects.json:/etc/superbase2/projects.json:z
+      - ./docker-compose.yml:/etc/superbase2/docker-compose.yml:ro,z
 
   # One-shot init container that ensures the manifest file exists on the host.
   # Uses the same bind mount so the file is created on the host filesystem,

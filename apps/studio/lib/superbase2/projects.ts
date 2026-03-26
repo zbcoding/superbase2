@@ -267,7 +267,7 @@ function generateJwt(role: string, secret: string): string {
 
 export function generateProjectSecrets(name: string) {
   const ref = crypto.randomBytes(10).toString('hex')
-  const jwtSecret = crypto.randomBytes(32).toString('base64')
+  const jwtSecret = crypto.randomBytes(30).toString('base64')
   const anonKey = generateJwt('anon', jwtSecret)
   const serviceRoleKey = generateJwt('service_role', jwtSecret)
   // Validation already rejects hyphens/symbols — no fallback transform needed.

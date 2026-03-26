@@ -50,6 +50,20 @@ function getAdminPool(): Pool {
   return _adminPool
 }
 
+/**
+ * Test Postgres connectivity. Call before project creation to fail fast
+ * with a clear error instead of a confusing pool timeout.
+ */
+export async function checkPostgresConnection(): Promise<void> {
+  const pool = getAdminPool()
+  const client = await pool.connect()
+  try {
+    await client.query('SELECT 1')
+  } finally {
+    client.release()
+  }
+}
+
 // Validation constants — keep in sync with isValidProjectName() and superbase2.sh
 export const MAX_PROJECT_NAME_LENGTH = 48
 export const MAX_DB_NAME_LENGTH = 63 // Postgres identifier limit

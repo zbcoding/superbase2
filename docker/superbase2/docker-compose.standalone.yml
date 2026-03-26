@@ -1,23 +1,26 @@
-# SuperBase² — single-file deployment for Coolify
+# SuperBase² — single-file deployment fallback
+#
+# ⚠️  DO NOT USE ON COOLIFY — Coolify supports multiple compose files.
+#     Use the overlay approach instead (no drift, no manual maintenance):
+#
+#       Coolify → Docker Compose start command:
+#         docker compose -f docker-compose.yml -f docker-compose.superbase2.yml up -d
+#       Base directory: docker/
+#
+#     docker-compose.superbase2.yml already has the build: section and manifest
+#     mount — that is all Coolify needs on top of the unmodified upstream file.
 #
 # ⚠️  MAINTENANCE NOTE: This file is a manually maintained merge of the upstream
-# docker-compose.yml + docker-compose.superbase2.yml. When Supabase releases
-# updates that change their docker-compose.yml (new env vars, image versions,
-# new services), you must manually sync those changes into this file.
+# docker-compose.yml + docker-compose.superbase2.yml. It exists ONLY for platforms
+# that truly support a single compose file (rare). When Supabase releases updates
+# that change their docker-compose.yml (new env vars, image versions, new services),
+# you must manually sync those changes into this file.
 # Compare with: docker/docker-compose.yml
 #
-# Use this if your hosting platform (Coolify, Portainer, etc.) only supports
-# a single compose file.
+# ⚠️  IMPORTANT: This file builds the Studio from your fork's source code.
+# The upstream supabase/studio image does NOT include SuperBase² API routes.
 #
-# Setup on Coolify:
-#   1. Add your fork as a Git source
-#   2. Set base directory to: docker
-#      (so Coolify reads upstream's .env.example for env var GUI)
-#   3. Set compose file to: superbase2/docker-compose.coolify.yml
-#   4. Fill in environment variables in Coolify's GUI
-#   5. Deploy
-#
-# Required environment variables (set in Coolify's UI):
+# Required environment variables:
 #   POSTGRES_PASSWORD        (generate: openssl rand -hex 16)
 #   JWT_SECRET               (generate: openssl rand -base64 30)
 #   ANON_KEY                 (generate via utils/generate-keys.sh)
@@ -57,12 +60,18 @@ services:
         else
           echo "[SuperBase²] Projects manifest already exists"
         fi
+        chmod 600 /etc/superbase2/projects.json
 
   # ─── Studio (with SuperBase² enabled) ──────────────────────────────────────
 
   studio:
     container_name: supabase-studio
-    image: supabase/studio:2026.02.16-sha-26c615c
+    # Build from this fork's source — the upstream image does not include SuperBase² routes.
+    build:
+      context: ..
+      dockerfile: apps/studio/Dockerfile
+      target: production
+    image: supabase/studio:superbase2-local
     restart: unless-stopped
     healthcheck:
       test:
@@ -112,10 +121,13 @@ services:
       # SuperBase²
       SUPERBASE2_ENABLED: "true"
       SUPERBASE2_MANIFEST: /etc/superbase2/projects.json
+      SUPERBASE2_COMPOSE_FILE: /etc/superbase2/docker-compose.yml
+      SUPERBASE2_COMPOSE_CMD: "docker compose -f superbase2/docker-compose.standalone.yml"
     volumes:
       - ../volumes/snippets:/app/snippets:Z
       - ../volumes/functions:/app/edge-functions:Z
       - ${SUPERBASE2_DIR:-./superbase2}/projects.json:/etc/superbase2/projects.json:z
+      - ./docker-compose.standalone.yml:/etc/superbase2/docker-compose.yml:ro,z
 
   # ─── Kong (API Gateway) ───────────────────────────────────────────────────
 

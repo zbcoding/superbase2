@@ -28,14 +28,14 @@ SuperBase² is designed so that updating Supabase is painless:
 
 - **Zero modifications to existing Supabase files.** Every SuperBase² file is new — new directories, new API routes, new middleware, new compose files. Nothing in the original Supabase codebase is edited.
 - **`git pull` just works.** Because no upstream files are touched, pulling new Supabase releases won't cause merge conflicts. The only theoretical future conflict is if Supabase adds their own `middleware.ts` (they don't have one today) — and that would be a one-time, straightforward merge.
-- **Stock Docker images.** SuperBase² uses the exact same official Supabase Docker images. No custom builds, no forks of individual services. When Supabase releases a new version of GoTrue or PostgREST, you pull the new image and restart.
+- **Stock Docker images for all services.** Per-project services (GoTrue, PostgREST, Realtime, Storage, Edge Functions, postgres-meta) use the exact same official Supabase Docker images — no forks, no custom builds. When Supabase releases a new version, pull and restart. The Studio is the one exception: it must be built from this fork's source because the SuperBase² API routes live inside it.
 - **Upgrade detection built in.** The `/sb2` dashboard checks Docker Hub for newer image tags and shows a banner when updates are available, along with the exact commands to run.
 
 ```
 # Upgrading is three commands:
 git pull upstream master
-docker compose -f superbase2/docker-compose.coolify.yml pull
-docker compose -f superbase2/docker-compose.coolify.yml up -d
+docker compose -f docker-compose.yml -f docker-compose.superbase2.yml pull
+docker compose -f docker-compose.yml -f docker-compose.superbase2.yml up -d
 ```
 
 ## Architecture
@@ -88,9 +88,10 @@ The install script handles everything interactively:
 1. Checks prerequisites (Docker, openssl)
 2. Generates all secrets
 3. Asks for your domain (or defaults to localhost)
-4. Pulls Docker images
-5. Starts the shared infrastructure
-6. Optionally creates your first project
+4. Builds the Studio from source (~5–15 min on first run, cached after that)
+5. Pulls all other Docker images
+6. Starts the shared infrastructure
+7. Optionally creates your first project
 
 Or non-interactively:
 
@@ -104,27 +105,37 @@ Or non-interactively:
 2. In Coolify: **New Resource → Docker Compose**
 3. Git source: your fork, branch with SuperBase²
 4. Base directory: `docker` (important — this is where upstream's `.env.example` lives, so Coolify auto-detects all Supabase env vars in its GUI)
-5. Compose file: `superbase2/docker-compose.coolify.yml`
+5. Custom start command:
+   ```
+   docker compose -f docker-compose.yml -f docker-compose.superbase2.yml up -d
+   ```
 6. Coolify shows all the environment variables from Supabase's `.env.example` in its GUI. Generate secrets locally and fill them in:
    ```bash
    cd docker && sh utils/generate-keys.sh
    ```
    Update `SUPABASE_PUBLIC_URL` and `API_EXTERNAL_URL` to your domain.
-   The two SuperBase² variables (`SUPERBASE2_ENABLED`, `SUPERBASE2_MANIFEST`) are hardcoded in the compose file — you don't need to configure them.
-7. Deploy
+   The two SuperBase² variables (`SUPERBASE2_ENABLED`, `SUPERBASE2_MANIFEST`) are hardcoded in `docker-compose.superbase2.yml` — you don't need to configure them.
+7. Deploy — Coolify will build the Studio from your fork's source on first deploy (5–15 min). Subsequent deploys are fast due to Docker layer caching.
 
-Once running, open `/sb2` in your browser to create projects.
-
-**Why base directory is `docker/` and not `docker/superbase2/`:** Coolify reads `.env.example` from the base directory to populate its env var GUI. By pointing at `docker/`, Coolify reads Supabase's upstream `.env.example` directly — so when Supabase adds new variables, they automatically appear in your Coolify GUI without any SuperBase² changes. Zero merge conflicts.
-
-### Option C: Two-file compose (advanced)
-
-If you already have Supabase self-hosted running and want to add SuperBase² on top:
+Once running, open `/sb2` in your browser to create projects. After creating a project in the UI, SSH into the server to start its containers:
 
 ```bash
-cd docker
-docker compose -f docker-compose.yml -f docker-compose.superbase2.yml up -d
+cd docker/superbase2
+./superbase2.sh up myproject
 ```
+
+Or skip the UI and do everything from SSH:
+
+```bash
+cd docker/superbase2
+./superbase2.sh setup myproject   # create + start in one step
+```
+
+**Why the overlay approach instead of a single file:** `docker-compose.superbase2.yml` only adds what SuperBase² needs on top of the unmodified upstream `docker-compose.yml`. When Supabase releases updates, `git pull` picks them up with zero merge conflicts. A single merged file would need manual syncing on every Supabase release.
+
+**Why base directory is `docker/` and not `docker/superbase2/`:** Coolify reads `.env.example` from the base directory to populate its env var GUI. By pointing at `docker/`, Coolify reads Supabase's upstream `.env.example` directly — so when Supabase adds new variables, they automatically appear in your Coolify GUI without any SuperBase² changes.
+
+**Why per-project containers need SSH:** Starting Docker containers requires Docker socket access, which the Studio web app doesn't have. The `/sb2` UI creates the database and secrets; SSH handles the container lifecycle. This is standard for Coolify — Coolify's terminal or an SSH connection both work.
 
 ---
 
@@ -132,16 +143,23 @@ docker compose -f docker-compose.yml -f docker-compose.superbase2.yml up -d
 
 ### Creating projects
 
-**From the browser:**
-
-Navigate to `/sb2`, type a project name, click Create. This creates the database and secrets. You'll need to SSH in to start the per-project containers:
+**Quickest way (SSH only):**
 
 ```bash
 cd docker/superbase2
-./superbase2.sh up myproject
+./superbase2.sh setup myproject   # creates DB, secrets, Kong routes, starts containers
 ```
 
-**From the command line:**
+**From the browser + SSH:**
+
+1. Navigate to `/sb2`, type a project name, click Create (creates DB + secrets)
+2. SSH into the server and start the containers:
+   ```bash
+   cd docker/superbase2
+   ./superbase2.sh up myproject
+   ```
+
+**Two-step CLI (if you need to customize between create and start):**
 
 ```bash
 ./superbase2.sh create myproject   # creates DB, secrets, Kong routes
@@ -200,7 +218,7 @@ SuperBase² adds these files (all new, none modified):
 | `docker/superbase2/superbase2.sh` | CLI for creating/managing projects and per-project containers |
 | `docker/superbase2/templates/` | Docker Compose and Kong config templates for per-project services |
 | `docker/docker-compose.superbase2.yml` | Overlay that enables SB2 on the Studio container |
-| `docker/superbase2/docker-compose.coolify.yml` | All-in-one compose file for single-file deployment platforms |
+| `docker/superbase2/docker-compose.standalone.yml` | All-in-one merged file for platforms that only support a single compose file (not needed for Coolify) |
 
 The middleware (`middleware.ts`) is the key integration point. When `SUPERBASE2_ENABLED=true`, it intercepts requests to `/api/platform/projects`, `/api/platform/organizations/*/projects`, and `/api/platform/profile`, rewriting them to the SB2 API routes. The SB2 routes read from a shared `projects.json` manifest instead of returning the hardcoded single default project.
 
@@ -210,7 +228,7 @@ The existing Studio UI components — project switcher, command palette, project
 
 ## Known limitations
 
-- **Per-project containers need CLI to start.** Creating a project via the `/sb2` UI creates the database and manifest entry, but starting GoTrue/PostgREST/etc. requires running `./superbase2.sh up <name>` on the server. This is because starting Docker containers requires Docker socket access, which Studio doesn't have.
+- **Per-project containers need SSH to start.** Creating a project via the `/sb2` UI creates the database and manifest entry, but starting GoTrue/PostgREST/etc. requires running `./superbase2.sh up <name>` on the server (or `./superbase2.sh setup <name>` to do both from SSH). This is because Docker socket access is needed, which Studio doesn't have. On Coolify, use the built-in terminal or SSH.
 - **Kong API keys are per-project.** Each project gets its own consumers and API key credentials in Kong, generated during `rebuild-kong`. Projects are isolated at both the Kong routing layer (API key validation) and the JWT level (per-service JWT secrets).
 - **No per-project Studio UI yet.** Studio shows all projects but doesn't scope its postgres-meta connection per project when you switch. This is a future improvement.
 - **Untested at scale.** This has been tested with a handful of projects. Running 50+ projects on one instance is uncharted territory.

@@ -22,6 +22,7 @@ interface CreatedProject extends Project {
   jwt_secret?: string
   anon_key?: string
   service_role_key?: string
+  next_steps?: string[]
 }
 
 interface ServiceInfo {
@@ -69,8 +70,9 @@ export default function SB2Dashboard() {
   const [copied, setCopied] = useState<string | null>(null)
   const [expandedRef, setExpandedRef] = useState<string | null>(null)
   const [services, setServices] = useState<Record<string, ServiceInfo[]>>({})
-  const [togglingService, setTogglingService] = useState(false)
+  const [togglingService, setTogglingService] = useState<string | null>(null)
   const [serviceChanged, setServiceChanged] = useState<string | null>(null)
+  const [serviceError, setServiceError] = useState<string | null>(null)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -122,6 +124,29 @@ export default function SB2Dashboard() {
   // Reset page when search changes
   useEffect(() => { setPage(0) }, [search])
 
+  /** POST with automatic CSRF retry: if the token hasn't been set yet
+   *  (fresh page load), the first POST returns 403. We fetch projects (GET)
+   *  to plant the cookie, then retry the POST once. */
+  const postWithCsrfRetry = async (url: string, body: unknown): Promise<Response> => {
+    const doPost = () =>
+      fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-SB2-CSRF': getCsrfToken(),
+        },
+        body: JSON.stringify(body),
+      })
+
+    const res = await doPost()
+    if (res.status === 403) {
+      // Plant the CSRF cookie via a GET, then retry once
+      await fetch('/api/superbase2/projects')
+      return doPost()
+    }
+    return res
+  }
+
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!newName.trim() || creating) return
@@ -131,14 +156,7 @@ export default function SB2Dashboard() {
     setCreatedProject(null)
 
     try {
-      const res = await fetch('/api/superbase2/projects', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-SB2-CSRF': getCsrfToken(),
-        },
-        body: JSON.stringify({ name: newName.trim() }),
-      })
+      const res = await postWithCsrfRetry('/api/superbase2/projects', { name: newName.trim() })
 
       if (!res.ok) {
         let message = 'Failed to create project'
@@ -163,6 +181,22 @@ export default function SB2Dashboard() {
     }
   }
 
+  /** DELETE with automatic CSRF retry (same pattern as postWithCsrfRetry). */
+  const deleteWithCsrfRetry = async (url: string): Promise<Response> => {
+    const doDelete = () =>
+      fetch(url, {
+        method: 'DELETE',
+        headers: { 'X-SB2-CSRF': getCsrfToken() },
+      })
+
+    const res = await doDelete()
+    if (res.status === 403) {
+      await fetch('/api/superbase2/projects')
+      return doDelete()
+    }
+    return res
+  }
+
   const handleDelete = async (ref: string, name: string) => {
     if (!confirm(`Delete project '${name}'?\n\nThis drops the database permanently. Stop per-project containers first.`)) {
       return
@@ -171,10 +205,7 @@ export default function SB2Dashboard() {
     setError('')
 
     try {
-      const res = await fetch(`/api/superbase2/projects/${ref}`, {
-        method: 'DELETE',
-        headers: { 'X-SB2-CSRF': getCsrfToken() },
-      })
+      const res = await deleteWithCsrfRetry(`/api/superbase2/projects/${ref}`)
       if (!res.ok) {
         let message = 'Failed to delete project'
         try { message = (await res.json()).error?.message || message } catch {}
@@ -210,21 +241,29 @@ export default function SB2Dashboard() {
   }
 
   const handleToggleService = async (ref: string, serviceName: string, currentlyEnabled: boolean) => {
-    setTogglingService(true)
+    setTogglingService(ref)
+    setServiceError(null)
     try {
       const current = services[ref] || []
       const newDisabled = current
         .filter((s) => (s.name === serviceName ? currentlyEnabled : !s.enabled))
         .map((s) => s.name)
 
-      const res = await fetch(`/api/superbase2/projects/${ref}/services`, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-SB2-CSRF': getCsrfToken(),
-        },
-        body: JSON.stringify({ disabled_services: newDisabled }),
-      })
+      const doPatch = () =>
+        fetch(`/api/superbase2/projects/${ref}/services`, {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-SB2-CSRF': getCsrfToken(),
+          },
+          body: JSON.stringify({ disabled_services: newDisabled }),
+        })
+
+      let res = await doPatch()
+      if (res.status === 403) {
+        await fetch('/api/superbase2/projects')
+        res = await doPatch()
+      }
 
       if (res.ok) {
         setServices((prev) => ({
@@ -234,11 +273,15 @@ export default function SB2Dashboard() {
           ),
         }))
         setServiceChanged(ref)
+      } else {
+        let message = 'Failed to toggle service'
+        try { message = (await res.json()).error?.message || message } catch {}
+        setServiceError(message)
       }
-    } catch {
-      // Ignore toggle errors
+    } catch (err: unknown) {
+      setServiceError(err instanceof Error ? err.message : 'Failed to toggle service')
     } finally {
-      setTogglingService(false)
+      setTogglingService(null)
     }
   }
 
@@ -263,9 +306,15 @@ export default function SB2Dashboard() {
               <span style={styles.logoText}>SuperBase²</span>
             </div>
             <nav aria-label="SuperBase² navigation" style={styles.headerLinks}>
-              <Link href={projects.length > 0 ? `/project/${projects[0].ref}` : '/sb2'} style={styles.headerLink}>
-                Studio →
-              </Link>
+              {projects.length > 0 ? (
+                <Link href={`/project/${projects[0].ref}`} style={styles.headerLink}>
+                  Studio →
+                </Link>
+              ) : (
+                <span style={{ ...styles.headerLink, opacity: 0.4, cursor: 'default' }} title="Create a project first">
+                  Studio →
+                </span>
+              )}
             </nav>
           </div>
         </header>
@@ -326,6 +375,23 @@ export default function SB2Dashboard() {
               <p style={{ fontSize: 13, color: SB2_MUTED, marginBottom: 12 }}>
                 These secrets are only shown once. Copy them now.
               </p>
+              {createdProject.next_steps && createdProject.next_steps.length > 0 && (
+                <div style={{ ...styles.restartNotice, marginBottom: 12 }}>
+                  <div style={{ marginBottom: 4, fontWeight: 600 }}>SSH into your server and run:</div>
+                  <div style={{ position: 'relative' as const, width: '100%' }}>
+                    <pre style={{ ...styles.upgradeCode, margin: 0 }}>
+                      {`cd docker/superbase2\n${createdProject.next_steps[0]}`}
+                    </pre>
+                    <button
+                      onClick={() => handleCopy(`cd docker/superbase2 && ${createdProject.next_steps![0]}`, 'ssh-cmd')}
+                      style={{ ...styles.copyBtn, position: 'absolute' as const, top: 8, right: 8 }}
+                      aria-label="Copy SSH command"
+                    >
+                      {copied === 'ssh-cmd' ? 'Copied' : 'Copy'}
+                    </button>
+                  </div>
+                </div>
+              )}
               {[
                 { label: 'Project Ref', value: createdProject.ref },
                 { label: 'JWT Secret', value: createdProject.jwt_secret },
@@ -376,9 +442,11 @@ export default function SB2Dashboard() {
             </form>
             {error && <p style={styles.error} role="alert" aria-live="polite">{error}</p>}
             <p id="sb2-project-hint" style={styles.hint}>
-              Creates the database and secrets. Only letters and numbers allowed (no underscores or hyphens — required for Docker DNS). Run{' '}
-              <code style={styles.code}>./superbase2.sh up {'<name>'}</code> on the server to start
-              the per-project containers.
+              Creates the database and secrets. Only letters and numbers allowed (no underscores or hyphens — required for Docker DNS). SSH into
+              the server and run{' '}
+              <code style={styles.code}>./superbase2.sh up {'<name>'}</code> to start
+              per-project containers, or use{' '}
+              <code style={styles.code}>./superbase2.sh setup {'<name>'}</code> to create + start in one step from the CLI.
             </p>
           </section>
 
@@ -425,15 +493,9 @@ export default function SB2Dashboard() {
                       >
                         <div style={styles.cardHeader}>
                           <span style={styles.cardName}>{p.name}</span>
-                          <span
-                            style={{
-                              ...styles.statusDot,
-                              backgroundColor:
-                                p.status === 'ACTIVE_HEALTHY' ? '#22c55e' : '#eab308',
-                            }}
-                            role="img"
-                            aria-label={p.status === 'ACTIVE_HEALTHY' ? 'Healthy' : 'Warning'}
-                          />
+                          <span style={styles.statusBadge}>
+                            {p.status === 'ACTIVE_HEALTHY' ? 'active' : p.status.toLowerCase().replace(/_/g, ' ')}
+                          </span>
                         </div>
                       </Link>
                       <div style={styles.cardMeta}>
@@ -480,7 +542,7 @@ export default function SB2Dashboard() {
                                     type="checkbox"
                                     checked={svc.enabled}
                                     onChange={() => handleToggleService(p.ref, svc.name, svc.enabled)}
-                                    disabled={togglingService}
+                                    disabled={togglingService === p.ref}
                                     style={{ marginRight: 8, accentColor: SB2_ACCENT }}
                                   />
                                   <div style={{ flex: 1, minWidth: 0 }}>
@@ -492,6 +554,9 @@ export default function SB2Dashboard() {
                                   </div>
                                 </label>
                               ))}
+                              {serviceError && expandedRef === p.ref && (
+                                <p style={{ ...styles.error, marginTop: 8, marginBottom: 0 }} role="alert">{serviceError}</p>
+                              )}
                               {serviceChanged === p.ref && (
                                 <div style={styles.restartNotice}>
                                   Restart to apply: <code style={styles.code}>./superbase2.sh down {p.name} && ./superbase2.sh up {p.name}</code>
@@ -800,11 +865,15 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 600,
     fontSize: 15,
   },
-  statusDot: {
-    width: 8,
-    height: 8,
-    borderRadius: '50%',
-    display: 'inline-block',
+  statusBadge: {
+    fontSize: 10,
+    color: SB2_MUTED,
+    backgroundColor: SB2_BG,
+    padding: '2px 8px',
+    borderRadius: 4,
+    border: `1px solid ${SB2_BORDER}`,
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.04em',
   },
   cardMeta: {
     marginTop: 8,

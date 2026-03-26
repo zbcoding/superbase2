@@ -7,7 +7,8 @@
 # Storage, Edge Functions, postgres-meta).
 #
 # Usage:
-#   ./superbase2.sh create <name>         Create a new project
+#   ./superbase2.sh setup <name>          Create + start a project in one step
+#   ./superbase2.sh create <name>         Create a new project (DB + secrets only)
 #   ./superbase2.sh destroy <name>        Destroy a project (removes containers + data)
 #   ./superbase2.sh list                  List all projects
 #   ./superbase2.sh up [name]             Start project containers (all if no name)
@@ -241,13 +242,13 @@ cmd_create() {
     local project_dir="$PROJECTS_DIR/$name"
     mkdir -p "$project_dir"
     mkdir -p "$project_dir/volumes/storage-${name}"
-    mkdir -p "$project_dir/volumes/functions/main"
+    mkdir -p "$project_dir/volumes/functions-${name}/main"
 
     # Copy the shared edge functions entrypoint so the container can start.
     if [ -f "$DOCKER_DIR/volumes/functions/main/index.ts" ]; then
-        cp "$DOCKER_DIR/volumes/functions/main/index.ts" "$project_dir/volumes/functions/main/index.ts"
+        cp "$DOCKER_DIR/volumes/functions/main/index.ts" "$project_dir/volumes/functions-${name}/main/index.ts"
     else
-        cat > "$project_dir/volumes/functions/main/index.ts" <<'EOFUNC'
+        cat > "$project_dir/volumes/functions-${name}/main/index.ts" <<'EOFUNC'
 import { serve } from "https://deno.land/std/http/server.ts"
 serve(() => new Response("ok"))
 EOFUNC
@@ -324,7 +325,7 @@ MAILER_URLPATHS_EMAIL_CHANGE=${MAILER_URLPATHS_EMAIL_CHANGE:-/auth/v1/verify}
 
 # Storage
 GLOBAL_S3_BUCKET=${GLOBAL_S3_BUCKET:-stub}
-REGION=${REGION:-stub}
+REGION=${REGION:-local}
 STORAGE_TENANT_ID=$project_ref
 IMGPROXY_ENABLE_WEBP_DETECTION=${IMGPROXY_ENABLE_WEBP_DETECTION:-true}
 
@@ -540,13 +541,27 @@ cmd_up() {
     local name="${1:-}"
 
     if [ -z "$name" ]; then
-        # Start all projects
+        # Start all projects — generate any missing disk state first, then rebuild
+        # Kong once and start all containers.
         for proj in $(list_projects); do
-            cmd_up "$proj"
+            _ensure_disk_state "$proj"
+        done
+        # Rebuild Kong once for all projects
+        cmd_rebuild_kong
+        for proj in $(list_projects); do
+            _start_project "$proj"
         done
         return
     fi
 
+    _ensure_disk_state "$name"
+    cmd_rebuild_kong
+    _start_project "$name"
+}
+
+# Ensure disk state exists for a project (generate from manifest if needed).
+_ensure_disk_state() {
+    local name="$1"
     local project_dir="$PROJECTS_DIR/$name"
 
     # If project exists in manifest but has no disk directory, generate disk state
@@ -581,6 +596,12 @@ cmd_up() {
             > "$project_dir/docker-compose.yml"
         filter_disabled_services "$project_dir/docker-compose.yml" "$name"
     fi
+}
+
+# Start containers for a single project (assumes disk state + Kong are ready).
+_start_project() {
+    local name="$1"
+    local project_dir="$PROJECTS_DIR/$name"
 
     echo "Starting project: $name"
     docker compose -f "$project_dir/docker-compose.yml" \
@@ -608,13 +629,13 @@ _generate_disk_state_from_manifest() {
     ensure_projects_dir
     mkdir -p "$project_dir"
     mkdir -p "$project_dir/volumes/storage-${name}"
-    mkdir -p "$project_dir/volumes/functions/main"
+    mkdir -p "$project_dir/volumes/functions-${name}/main"
 
     # Copy the shared edge functions entrypoint so the container can start.
     if [ -f "$DOCKER_DIR/volumes/functions/main/index.ts" ]; then
-        cp "$DOCKER_DIR/volumes/functions/main/index.ts" "$project_dir/volumes/functions/main/index.ts"
+        cp "$DOCKER_DIR/volumes/functions/main/index.ts" "$project_dir/volumes/functions-${name}/main/index.ts"
     else
-        cat > "$project_dir/volumes/functions/main/index.ts" <<'EOFUNC'
+        cat > "$project_dir/volumes/functions-${name}/main/index.ts" <<'EOFUNC'
 import { serve } from "https://deno.land/std/http/server.ts"
 serve(() => new Response("ok"))
 EOFUNC
@@ -684,7 +705,7 @@ MAILER_URLPATHS_EMAIL_CHANGE=${MAILER_URLPATHS_EMAIL_CHANGE:-/auth/v1/verify}
 
 # Storage
 GLOBAL_S3_BUCKET=${GLOBAL_S3_BUCKET:-stub}
-REGION=${REGION:-stub}
+REGION=${REGION:-local}
 STORAGE_TENANT_ID=$ref
 IMGPROXY_ENABLE_WEBP_DETECTION=${IMGPROXY_ENABLE_WEBP_DETECTION:-true}
 
@@ -710,9 +731,6 @@ EOF
 
     # Remove disabled service blocks from the compose file
     filter_disabled_services "$project_dir/docker-compose.yml" "$name"
-
-    # Rebuild Kong routes for this project
-    cmd_rebuild_kong
 
     echo "Disk state generated for project '$name'."
 }
@@ -797,6 +815,18 @@ cmd_client_config() {
     echo "Direct database connection:"
     echo "  postgresql://postgres:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT}/${PROJECT_DB}"
     echo ""
+}
+
+cmd_setup() {
+    local name="$1"
+
+    # setup = create + up in one step (convenience for Coolify / SSH users)
+    cmd_create "$name"
+    cmd_up "$name"
+
+    echo ""
+    echo "Project '$name' is fully running!"
+    echo "  Client config:  ./superbase2.sh client-config $name"
 }
 
 cmd_rebuild_kong() {
@@ -1157,7 +1187,8 @@ usage() {
     echo "Usage: $0 <command> [args]"
     echo ""
     echo "Commands:"
-    echo "  create <name>         Create a new project"
+    echo "  setup <name>          Create + start a project in one step"
+    echo "  create <name>         Create a new project (DB + secrets only)"
     echo "  destroy <name>        Destroy a project"
     echo "  list                  List all projects"
     echo "  up [name]             Start project containers (all if no name)"
@@ -1168,6 +1199,10 @@ usage() {
 }
 
 case "${1:-}" in
+    setup)
+        [ -z "${2:-}" ] && { echo "Error: project name required"; usage; exit 1; }
+        cmd_setup "$2"
+        ;;
     create)
         [ -z "${2:-}" ] && { echo "Error: project name required"; usage; exit 1; }
         cmd_create "$2"

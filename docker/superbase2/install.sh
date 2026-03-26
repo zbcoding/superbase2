@@ -79,6 +79,12 @@ if ! command -v openssl >/dev/null 2>&1; then
     exit 1
 fi
 
+if ! command -v jq >/dev/null 2>&1; then
+    err "jq is required but not found."
+    err "  Install it with:  apt-get install jq  /  brew install jq  /  apk add jq"
+    exit 1
+fi
+
 if ! docker info >/dev/null 2>&1; then
     err "Docker daemon is not running. Start Docker first."
     exit 1
@@ -142,10 +148,17 @@ if [ ! -f "$SCRIPT_DIR/projects.json" ]; then
     echo '{ "projects": [] }' > "$SCRIPT_DIR/projects.json"
 fi
 
-# ─── Pull images ────────────────────────────────────────────────────────────
+# ─── Build Studio from source ────────────────────────────────────────────────
+
+info "Building Studio from source (first run: 5-15 min, subsequent runs are fast)..."
+docker compose -f docker-compose.yml -f docker-compose.superbase2.yml build studio
+ok "Studio built"
+
+# ─── Pull remaining images ───────────────────────────────────────────────────
 
 info "Pulling Docker images (this may take a few minutes)..."
-docker compose -f docker-compose.yml -f docker-compose.superbase2.yml pull
+# --ignore-buildable skips Studio since it has a build: section and was just built above
+docker compose -f docker-compose.yml -f docker-compose.superbase2.yml pull --ignore-buildable
 ok "Images pulled"
 
 # ─── Start shared infrastructure ────────────────────────────────────────────
@@ -173,11 +186,8 @@ done
 # ─── Create first project if requested ──────────────────────────────────────
 
 if [ -n "$FIRST_PROJECT" ]; then
-    info "Creating project: $FIRST_PROJECT"
-    bash "$SCRIPT_DIR/superbase2.sh" create "$FIRST_PROJECT"
-
-    info "Starting project containers..."
-    bash "$SCRIPT_DIR/superbase2.sh" up "$FIRST_PROJECT"
+    info "Setting up project: $FIRST_PROJECT"
+    bash "$SCRIPT_DIR/superbase2.sh" setup "$FIRST_PROJECT"
 
     ok "Project '$FIRST_PROJECT' is running"
 fi
@@ -189,8 +199,7 @@ if [ "$AUTO" = false ] && [ -z "$FIRST_PROJECT" ]; then
     read -r -p "Create a project now? (name or Enter to skip): " proj_name
 
     if [ -n "$proj_name" ]; then
-        bash "$SCRIPT_DIR/superbase2.sh" create "$proj_name"
-        bash "$SCRIPT_DIR/superbase2.sh" up "$proj_name"
+        bash "$SCRIPT_DIR/superbase2.sh" setup "$proj_name"
         FIRST_PROJECT="$proj_name"
     fi
 fi
@@ -215,9 +224,9 @@ if [ -n "$FIRST_PROJECT" ]; then
 fi
 
 echo -e "  ${BOLD}Commands:${NC}"
-echo "    ./superbase2.sh create <name>    Create a project"
+echo "    ./superbase2.sh setup <name>     Create + start a project"
 echo "    ./superbase2.sh list             List projects"
-echo "    ./superbase2.sh up <name>        Start a project"
+echo "    ./superbase2.sh status           Show container status"
 echo "    ./superbase2.sh client-config <name>"
 echo ""
 echo -e "  ${BOLD}Upgrade Supabase:${NC}"

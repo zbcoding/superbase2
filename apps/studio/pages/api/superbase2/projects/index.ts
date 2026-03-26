@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from 'next'
 
 import { requireAuth, checkCsrf } from 'lib/superbase2/auth'
-import { createProjectDatabase, isValidProjectName } from 'lib/superbase2/db'
+import { checkPostgresConnection, createProjectDatabase, isValidProjectName } from 'lib/superbase2/db'
 import { addProjectIfNotExists, generateProjectSecrets, isSuperBase2Enabled, listProjects, removeProject } from 'lib/superbase2/projects'
 import {
   clampPagination,
@@ -63,6 +63,16 @@ async function handleCreate(req: NextApiRequest, res: NextApiResponse) {
       })
     }
 
+    // Fail fast if Postgres is unreachable — better than a confusing pool timeout
+    try {
+      await checkPostgresConnection()
+    } catch (connErr) {
+      console.error('[SuperBase²] Postgres connectivity check failed:', connErr)
+      return res.status(503).json({
+        error: { message: 'Cannot reach the database. Is Postgres running?' },
+      })
+    }
+
     // Generate secrets and project ref
     const project = generateProjectSecrets(name)
 
@@ -87,7 +97,13 @@ async function handleCreate(req: NextApiRequest, res: NextApiResponse) {
     }
 
     // Return full details including secrets — this is the only time they're shown
-    return res.status(201).json(toCreationResponse(project))
+    return res.status(201).json({
+      ...toCreationResponse(project),
+      next_steps: [
+        `./superbase2.sh up ${name}`,
+        `./superbase2.sh client-config ${name}`,
+      ],
+    })
   } catch (err: unknown) {
     console.error('Failed to create project:', err)
     return res.status(500).json({ error: { message: 'Failed to create project' } })
