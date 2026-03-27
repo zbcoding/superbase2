@@ -110,6 +110,7 @@ filter_disabled_services() {
 
     local tmp_file
     tmp_file=$(mktemp)
+    trap 'rm -f "$tmp_file" "${tmp_file}.new"' EXIT
     cp "$compose_file" "$tmp_file"
 
     for svc in $disabled; do
@@ -838,6 +839,7 @@ cmd_rebuild_kong() {
     # mid-build, the original kong.yml stays intact.
     local kong_tmp
     kong_tmp=$(mktemp)
+    trap 'rm -f "$kong_tmp"' EXIT
 
     # Backup original
     if [ ! -f "$kong_backup" ]; then
