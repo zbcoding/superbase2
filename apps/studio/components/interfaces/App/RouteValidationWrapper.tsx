@@ -9,7 +9,7 @@ import { useDashboardHistory } from '@/hooks/misc/useDashboardHistory'
 import { useLastVisitedOrganization } from '@/hooks/misc/useLastVisitedOrganization'
 import { useLatest } from '@/hooks/misc/useLatest'
 import { useSelectedOrganizationQuery } from '@/hooks/misc/useSelectedOrganization'
-import { IS_PLATFORM } from '@/lib/constants'
+import { IS_PLATFORM, SUPERBASE2_ENABLED } from '@/lib/constants'
 
 // Ideally these could all be within a _middleware when we use Next 12
 export const RouteValidationWrapper = ({ children }: PropsWithChildren<{}>) => {
@@ -23,7 +23,11 @@ export const RouteValidationWrapper = ({ children }: PropsWithChildren<{}>) => {
   const { setLastVisitedSnippet, setLastVisitedTable } = useDashboardHistory()
   const { lastVisitedOrganization, setLastVisitedOrganization } = useLastVisitedOrganization()
 
-  const DEFAULT_HOME = IS_PLATFORM
+  // SuperBase² has no `default` project ref — the SB2 API rejects it with 400,
+  // which would otherwise cause this wrapper to redirect to /project/default in
+  // a loop and toast "You do not have access to this project". Send users to
+  // the org-scoped multi-project home instead.
+  const DEFAULT_HOME = (IS_PLATFORM || SUPERBASE2_ENABLED)
     ? !!lastVisitedOrganization
       ? `/org/${lastVisitedOrganization}`
       : '/organizations'
@@ -80,8 +84,17 @@ export const RouteValidationWrapper = ({ children }: PropsWithChildren<{}>) => {
 
     // A successful request to project details will validate access to both project and branches
     if (!!ref && isErrorProject) {
-      // 404 means the project no longer exists (e.g. was deleted), not an access error
-      if (projectError?.code !== 404) {
+      console.log('[SB2 debug] project error', {
+        ref,
+        code: projectError?.code,
+        message: projectError?.message,
+        name: (projectError as any)?.name,
+        raw: projectError,
+      })
+      // 404 = project no longer exists (e.g. was deleted)
+      // 400 = ref doesn't match the SB2 ref format (e.g. legacy "default" bookmark)
+      // Neither is an access error — don't toast.
+      if (projectError?.code !== 404 && projectError?.code !== 400) {
         toast.error('You do not have access to this project')
       }
       router.push(DEFAULT_HOME)

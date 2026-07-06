@@ -1,9 +1,13 @@
 import { NextApiRequest, NextApiResponse } from 'next'
 
 import { apiWrapper } from '@/lib/api/apiWrapper'
-import { selfHostedSupabaseAdmin as supabase } from '@/lib/api/self-hosted-admin'
+import { requireAuth } from '@/lib/superbase2/auth'
+import { getAuthClient } from '@/lib/superbase2/auth-client'
 
-export default (req: NextApiRequest, res: NextApiResponse) => apiWrapper(req, res, handler)
+export default async (req: NextApiRequest, res: NextApiResponse) => {
+  if (!(await requireAuth(req, res))) return
+  return apiWrapper(req, res, handler)
+}
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   const { method } = req
@@ -19,8 +23,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
 const handleDelete = async (req: NextApiRequest, res: NextApiResponse) => {
   const { id } = req.query
+  const supabase = getAuthClient(req)
 
-  // Get all factors for the user
   const { data: factors, error } = await supabase.auth.admin.mfa.listFactors({
     userId: id as string,
   })
@@ -28,7 +32,7 @@ const handleDelete = async (req: NextApiRequest, res: NextApiResponse) => {
     return res.status(400).json({ error: { message: error.message } })
   }
 
-  factors?.factors.forEach(async (factor: any) => {
+  for (const factor of factors?.factors ?? []) {
     const { error } = await supabase.auth.admin.mfa.deleteFactor({
       id: factor.id,
       userId: id as string,
@@ -36,7 +40,7 @@ const handleDelete = async (req: NextApiRequest, res: NextApiResponse) => {
     if (error) {
       return res.status(400).json({ error: { message: error.message } })
     }
-  })
+  }
 
   return res.status(200).json({ data: null, error: null })
 }

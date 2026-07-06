@@ -4,9 +4,12 @@ import { constructHeaders } from '@/lib/api/apiHelpers'
 import { apiWrapper } from '@/lib/api/apiWrapper'
 import { executeQuery } from '@/lib/api/self-hosted/query'
 import { PgMetaDatabaseError } from '@/lib/api/self-hosted/types'
+import { guardSb2Project } from '@/lib/superbase2/auth'
 
-export default (req: NextApiRequest, res: NextApiResponse) =>
-  apiWrapper(req, res, handler, { withAuth: true })
+export default async (req: NextApiRequest, res: NextApiResponse) => {
+  if (!(await guardSb2Project(req, res))) return
+  return apiWrapper(req, res, handler, { withAuth: true })
+}
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   const { method } = req
@@ -22,8 +25,9 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
 const handlePost = async (req: NextApiRequest, res: NextApiResponse) => {
   const { query } = req.body
+  const { ref } = req.query
   const headers = constructHeaders(req.headers)
-  const { data, error } = await executeQuery({ query, headers })
+  const { data, error } = await executeQuery({ query, headers, ref })
 
   if (error) {
     if (error instanceof PgMetaDatabaseError) {

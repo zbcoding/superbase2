@@ -1,0 +1,6 @@
+# Normalize all text files to LF
+* text=auto eol=lf
+
+# Prevent CRLF conversion for files containing base64-encoded blobs
+docker/docker-compose.coolify.yml text eol=lf
+docker/superbase2/*.yml text eol=lf

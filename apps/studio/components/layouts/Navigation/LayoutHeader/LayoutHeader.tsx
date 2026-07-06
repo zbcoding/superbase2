@@ -29,7 +29,7 @@ import { getResourcesExceededLimitsOrg } from '@/components/ui/OveragesBanner/Ov
 import { useOrgUsageQuery } from '@/data/usage/org-usage-query'
 import { useSelectedOrganizationQuery } from '@/hooks/misc/useSelectedOrganization'
 import { useSelectedProjectQuery } from '@/hooks/misc/useSelectedProject'
-import { IS_PLATFORM } from '@/lib/constants'
+import { IS_PLATFORM, SUPERBASE2_ENABLED } from '@/lib/constants'
 import { useTrack } from '@/lib/telemetry/track'
 import { SHORTCUT_IDS } from '@/state/shortcuts/registry'
 import { useIsShortcutEnabled } from '@/state/shortcuts/useIsShortcutEnabled'
@@ -225,6 +225,20 @@ export const LayoutHeader = ({
             <BreadcrumbsView defaultValue={breadcrumbs} />
           </div>
           <div className="flex items-center gap-x-2">
+            {SUPERBASE2_ENABLED && (
+              <Link
+                href="/sb2"
+                title="Open SuperBase² dashboard — switch projects, manage services"
+                className={cn(
+                  'flex items-center gap-1.5 rounded-md border border-amber-400',
+                  'bg-amber-500 px-3 py-1.5 text-sm font-semibold text-black shadow-sm',
+                  'hover:bg-amber-400 hover:border-amber-300 transition-colors'
+                )}
+              >
+                <span aria-hidden className="text-base leading-none">⚡</span>
+                <span>SB²</span>
+              </Link>
+            )}
             {customHeaderComponents && customHeaderComponents}
             {IS_PLATFORM ? (
               <>

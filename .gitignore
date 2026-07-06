@@ -126,6 +126,8 @@ next-env.d.ts
 .claude/skills/me-*
 !.claude/CLAUDE.md
 CLAUDE.local.md
+.letta
+.deepseek
 
 #include template .env file for docker-compose
 !docker/.env
@@ -168,3 +170,4 @@ keys.json
 examples/**/package-lock.json
 examples/**/yarn.lock
 examples/**/pnpm-lock.yaml
+.osgrep

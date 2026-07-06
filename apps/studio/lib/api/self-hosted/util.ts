@@ -1,4 +1,5 @@
 import crypto from 'crypto-js'
+import type { NextApiRequest } from 'next'
 
 import {
   ENCRYPTION_KEY,
@@ -9,6 +10,7 @@ import {
   POSTGRES_USER_READ_ONLY,
   POSTGRES_USER_READ_WRITE,
 } from './constants'
+import { getProjectByRef } from './manifest'
 import { IS_PLATFORM } from '@/lib/constants'
 
 /**
@@ -24,8 +26,26 @@ export function encryptString(stringToEncrypt: string): string {
   return crypto.AES.encrypt(stringToEncrypt, ENCRYPTION_KEY).toString()
 }
 
-export function getConnectionString({ readOnly }: { readOnly: boolean }) {
+export function getConnectionString({
+  ref,
+  readOnly,
+}: {
+  ref?: string | string[]
+  readOnly: boolean
+}) {
   const postgresUser = readOnly ? POSTGRES_USER_READ_ONLY : POSTGRES_USER_READ_WRITE
+  const project = getProjectByRef(ref)
+  const database = project?.db ?? POSTGRES_DATABASE
 
-  return `postgresql://${postgresUser}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DATABASE}`
+  return `postgresql://${postgresUser}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${database}`
+}
+
+/**
+ * Adds an `x-connection-encrypted` header carrying a per-project connection
+ * string so pg-meta queries the correct DB for the current `[ref]` route.
+ * Falls back to the env-configured DB when no SuperBase² manifest is present.
+ */
+export function withConnectionHeader(req: NextApiRequest, headers: Record<string, any>) {
+  const connectionString = getConnectionString({ ref: req.query.ref, readOnly: false })
+  return { ...headers, 'x-connection-encrypted': encryptString(connectionString) }
 }

@@ -22,7 +22,7 @@ import { captureCriticalError } from '@/lib/error-reporting'
 import { auth, buildPathWithParams, getReturnToPath } from '@/lib/gotrue'
 import { useTrack } from '@/lib/telemetry/track'
 
-const schema = z.object({
+const signInSchema = z.object({
   email: z.string().min(1, 'Email is required').email('Must be a valid email'),
   password: z.string().min(1, 'Password is required'),
 })
@@ -39,8 +39,8 @@ export const SignInForm = () => {
   const [captchaToken, setCaptchaToken] = useState<string | null>(null)
   const captchaRef = useRef<HCaptcha>(null)
   const [returnTo, setReturnTo] = useState<string | null>(null)
-  const form = useForm<z.infer<typeof schema>>({
-    resolver: zodResolver(schema),
+  const form = useForm<z.infer<typeof signInSchema>>({
+    resolver: zodResolver(signInSchema),
     defaultValues: { email: '', password: '' },
   })
   const isSubmitting = form.formState.isSubmitting
@@ -59,7 +59,7 @@ export const SignInForm = () => {
     forgotPasswordUrl = `${forgotPasswordUrl}?returnTo=${encodeURIComponent(returnTo)}`
   }
 
-  const onSubmit: SubmitHandler<z.infer<typeof schema>> = async ({ email, password }) => {
+  const onSubmit: SubmitHandler<z.infer<typeof signInSchema>> = async ({ email, password }) => {
     const toastId = toast.loading('Signing in...')
 
     let token = captchaToken
@@ -133,7 +133,10 @@ export const SignInForm = () => {
           name="email"
           control={form.control}
           render={({ field }) => (
-            <FormItemLayout name="email" label="Email">
+            <FormItemLayout
+              name="email"
+              label="Email"
+            >
               <FormControl>
                 <Input
                   id="email"

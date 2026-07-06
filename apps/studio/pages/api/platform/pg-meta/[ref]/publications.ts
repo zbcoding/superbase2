@@ -3,10 +3,14 @@ import { NextApiRequest, NextApiResponse } from 'next'
 import { fetchGet } from '@/data/fetchers'
 import { constructHeaders } from '@/lib/api/apiHelpers'
 import { apiWrapper } from '@/lib/api/apiWrapper'
+import { withConnectionHeader } from '@/lib/api/self-hosted/util'
 import { PG_META_URL } from '@/lib/constants'
+import { guardSb2Project } from '@/lib/superbase2/auth'
 
-export default (req: NextApiRequest, res: NextApiResponse) =>
-  apiWrapper(req, res, handler, { withAuth: true })
+export default async (req: NextApiRequest, res: NextApiResponse) => {
+  if (!(await guardSb2Project(req, res))) return
+  return apiWrapper(req, res, handler, { withAuth: true })
+}
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   const { method } = req
@@ -21,7 +25,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 }
 
 const handleGetAll = async (req: NextApiRequest, res: NextApiResponse) => {
-  const headers = constructHeaders(req.headers)
+  const headers = withConnectionHeader(req, constructHeaders(req.headers))
   const response = await fetchGet(`${PG_META_URL}/publications`, { headers })
 
   if (response.error) {
