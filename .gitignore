@@ -119,12 +119,14 @@ next-env.d.ts
 
 # AI assistant local files
 .claude/*
-!.claude/settings.json
-!.claude/scripts/
-!.claude/skills/
+.claude/settings.json
+.claude/scripts/
+.claude/skills/
 .claude/skills/me-*
 CLAUDE.md
-!.claude/CLAUDE.md
+.claude/CLAUDE.md
+.letta
+.deepseek
 
 #include template .env file for docker-compose
 !docker/.env
@@ -167,3 +169,4 @@ keys.json
 examples/**/package-lock.json
 examples/**/yarn.lock
 examples/**/pnpm-lock.yaml
+.osgrep

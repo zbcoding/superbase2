@@ -1,9 +1,13 @@
 import { NextApiRequest, NextApiResponse } from 'next'
 
 import apiWrapper from '@/lib/api/apiWrapper'
-import { selfHostedSupabaseAdmin as supabase } from '@/lib/api/self-hosted-admin'
+import { requireAuth } from '@/lib/superbase2/auth'
+import { getStorageClient } from '@/lib/superbase2/storage-client'
 
-export default (req: NextApiRequest, res: NextApiResponse) => apiWrapper(req, res, handler)
+export default async (req: NextApiRequest, res: NextApiResponse) => {
+  if (!(await requireAuth(req, res))) return
+  return apiWrapper(req, res, handler)
+}
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   const { method } = req
@@ -19,6 +23,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
 const handlePost = async (req: NextApiRequest, res: NextApiResponse) => {
   const { id } = req.query
+  const supabase = getStorageClient(req)
 
   const { data, error } = await supabase.storage.emptyBucket(id as string)
   if (error) {

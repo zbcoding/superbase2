@@ -121,6 +121,16 @@ export function generateAuthMenu(options: GenerateAuthMenuOptions): ProductMenuG
                     },
                   ]
                 : []),
+              ...(passkeysInMenu
+                ? [
+                    {
+                      name: 'Passkeys',
+                      key: 'passkeys',
+                      url: `${baseUrl}/passkeys`,
+                      label: 'Beta',
+                    },
+                  ]
+                : []),
               {
                 name: 'OAuth Server',
                 key: 'oauth-server',

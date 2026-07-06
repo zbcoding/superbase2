@@ -68,7 +68,19 @@ import { useLastVisitedOrganization } from '@/hooks/misc/useLastVisitedOrganizat
 import { useSelectedOrganizationQuery } from '@/hooks/misc/useSelectedOrganization'
 import { withAuth } from '@/hooks/misc/withAuth'
 import { usePHFlag } from '@/hooks/ui/useFlag'
-import { DOCS_URL, PROJECT_STATUS, PROVIDERS, useDefaultProvider } from '@/lib/constants'
+import {
+  DOCS_URL,
+  PROJECT_STATUS,
+  PROVIDERS,
+  SUPERBASE2_ENABLED,
+  useDefaultProvider,
+} from '@/lib/constants'
+// Note: in SuperBase² mode most fields on this form (region, instance size,
+// HA, cloud provider, db password) are ignored by the SB² create handler —
+// they're hosted-cloud concepts. Rather than conditionally hiding fields
+// (which would require rewriting the schema + defaults + child components),
+// we just relabel the panel description so users know what actually gets
+// used. Keeps upstream merge surface to a single line block.
 import { buildStudioPageTitle } from '@/lib/page-title'
 import { useProfile } from '@/lib/profile'
 import { classifyApiError, classifyValidationError } from '@/lib/telemetry/funnel-errors'
@@ -537,8 +549,22 @@ const Wizard: NextPageWithLayout = () => {
               <div key="panel-title">
                 <h3>Create a new project</h3>
                 <p className="text-sm text-foreground-lighter text-balance">
-                  Your project will have its own dedicated instance and full Postgres database. An
-                  API will be set up so you can easily interact with your new database.
+                  {SUPERBASE2_ENABLED ? (
+                    <>
+                      Creates a new database on your shared Postgres instance. Only{' '}
+                      <strong>Project name</strong> is used — region, compute size, cloud
+                      provider, high availability, Postgres version, and the database password
+                      field are all <strong>ignored</strong> in self-hosted SuperBase² mode. The
+                      Postgres superuser password is whatever{' '}
+                      <code>POSTGRES_PASSWORD</code> is set to in your Coolify environment.
+                    </>
+                  ) : (
+                    <>
+                      Your project will have its own dedicated instance and full Postgres
+                      database. An API will be set up so you can easily interact with your new
+                      database.
+                    </>
+                  )}
                 </p>
               </div>
             }

@@ -1,4 +1,6 @@
 import { IS_PLATFORM } from 'common'
+import { useRouter } from 'next/router'
+import { useEffect } from 'react'
 import { PageContainer } from 'ui-patterns/PageContainer'
 import {
   PageHeader,
@@ -24,12 +26,21 @@ import { useSelectedProjectQuery } from '@/hooks/misc/useSelectedProject'
 import type { NextPageWithLayout } from '@/types'
 
 const ProjectSettings: NextPageWithLayout = () => {
+  const router = useRouter()
   const { data: project } = useSelectedProjectQuery()
   const { data: selectedOrganization } = useSelectedOrganizationQuery()
 
   const isBranch = !!project?.parent_project_ref
   const { projectsTransfer: projectTransferEnabled, projectSettingsCustomDomains } =
     useIsFeatureEnabled(['projects:transfer', 'project_settings:custom_domains'])
+
+  useEffect(() => {
+    if (!IS_PLATFORM) {
+      // sb2: redirect within the current project — refs aren't always "default" in multi-project mode
+      const ref = router.query.ref ?? 'default'
+      router.push(`/project/${ref}/settings/log-drains`)
+    }
+  }, [router])
 
   const { data: subscription } = useOrgSubscriptionQuery(
     { orgSlug: selectedOrganization?.slug },

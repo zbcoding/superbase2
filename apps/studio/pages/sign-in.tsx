@@ -14,7 +14,7 @@ import { useCustomContent } from '@/hooks/custom-content/useCustomContent'
 import { useEnabledIdentityProviders } from '@/hooks/misc/useEnabledIdentityProviders'
 import { useInboundBranding } from '@/hooks/misc/useInboundBranding'
 import { useIsFeatureEnabled } from '@/hooks/misc/useIsFeatureEnabled'
-import { IS_PLATFORM } from '@/lib/constants'
+import { IS_PLATFORM, SUPERBASE2_ENABLED } from '@/lib/constants'
 import type { ExternalIdentityProviderConfig } from '@/lib/external-identity-providers'
 import type { NextPageWithLayout } from '@/types'
 
@@ -76,10 +76,13 @@ const SignInPage: NextPageWithLayout = () => {
     )
   }
 
+  const showSignUp = signUpEnabled
+
   useEffect(() => {
     if (!IS_PLATFORM) {
-      // on selfhosted instance just redirect to projects page
-      router.replace('/project/default')
+      // Self-hosted: Kong handles auth via basic-auth popup. Skip sign-in page.
+      // SB2 has no `default` ref so route to org home instead of /project/default.
+      router.replace(SUPERBASE2_ENABLED ? '/organizations' : '/project/default')
     }
   }, [router])
 
@@ -118,7 +121,7 @@ const SignInPage: NextPageWithLayout = () => {
     <>
       <div className="flex flex-col gap-5">{renderAuthOptions(signInProviders)}</div>
 
-      {signUpEnabled && (
+      {showSignUp && (
         <div className="self-center my-8 text-sm">
           <span className="text-foreground-light">Don’t have an account?</span>{' '}
           <Link

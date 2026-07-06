@@ -40,7 +40,7 @@ COPY --from=turbo /app/out/pnpm-lock.yaml ./
 COPY ./patches/ ./patches
 
 # No need to clean cache because production uses standalone build
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --no-frozen-lockfile
 
 # dev contains dependencies and source code not compiled
 FROM deps AS dev
@@ -51,6 +51,32 @@ CMD ["pnpm", "dev:studio"]
 
 # Compile Next.js
 FROM dev AS builder
+
+# ── SuperBase² build-time NEXT_PUBLIC_* vars ──
+# Next.js inlines NEXT_PUBLIC_* into the client bundle at build time, so these
+# must be set when the image is built — flipping them in Coolify env at runtime
+# only affects server-side code paths. Coolify exposes build-time env via
+# `--build-arg` or its UI's "Build args" panel.
+#
+# Note: The GoTrue-auth flag is deliberately NOT a NEXT_PUBLIC_* var. See the
+# SUPERBASE2_GOTRUE_AUTH block below and lib/superbase2/auth.ts for why.
+ARG NEXT_PUBLIC_SUPERBASE2_ENABLED=true
+ARG NEXT_PUBLIC_GOTRUE_URL
+ENV NEXT_PUBLIC_SUPERBASE2_ENABLED=${NEXT_PUBLIC_SUPERBASE2_ENABLED}
+ENV NEXT_PUBLIC_GOTRUE_URL=${NEXT_PUBLIC_GOTRUE_URL}
+
+# ── SuperBase² runtime-only vars (no NEXT_PUBLIC_ prefix) ──
+# Intentionally NOT prefixed with NEXT_PUBLIC_ so the bundler can't inline
+# them and dead-code-eliminate the auth branches. Server-side code in
+# lib/superbase2/auth.ts reads process.env.SUPERBASE2_GOTRUE_AUTH at runtime;
+# the client receives the value via window.__SB2_RUNTIME__ injected by
+# _document.tsx. This means the flag can be flipped in the Coolify env
+# panel and takes effect on container restart — no rebuild required.
+#
+# The ARG+ENV here exists so builds that want to bake in a default still
+# can, but production deployments should set the runtime env var instead.
+ARG SUPERBASE2_GOTRUE_AUTH=false
+ENV SUPERBASE2_GOTRUE_AUTH=${SUPERBASE2_GOTRUE_AUTH}
 
 RUN pnpm --filter studio exec next build
 

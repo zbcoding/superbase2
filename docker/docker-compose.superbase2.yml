@@ -1,0 +1,203 @@
+# SuperBase² — multi-project overlay for self-hosted Supabase.
+#
+# Apply on top of the unmodified upstream docker-compose.yml:
+#   cd docker/
+#   docker compose -f docker-compose.yml -f docker-compose.superbase2.yml up -d
+#
+# On Coolify: set the custom start command to the line above (base directory: docker/).
+# This keeps docker-compose.yml 100% unmodified upstream — only this file changes.
+#
+# This overlay:
+# 1. Uses the pre-built SuperBase² Studio image from ghcr.io
+#    (the upstream supabase/studio image does not have SuperBase² routes)
+# 2. Enables SuperBase² in Studio so the middleware activates
+# 3. Bind-mounts the shared projects manifest so the CLI and Studio share state
+# 4. Adds a one-shot init container that ensures the manifest file exists on first boot
+#
+# The image is built automatically by CI on every push to master.
+# To build locally instead, see the commented-out build: block below.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Health check & robustness overrides for upstream services.
+# The upstream defaults are too aggressive for slower machines and first boots.
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+  kong:
+    healthcheck:
+      # Readiness probe: see docker-compose.coolify.yml for rationale.
+      test: ["CMD-SHELL", "curl -sS -o /dev/null --max-time 5 http://localhost:8000/"]
+      interval: 10s
+      timeout: 6s
+      start_period: 30s
+      retries: 6
+    labels:
+      - coolify.healthcheck.enabled=true
+
+  analytics:
+    healthcheck:
+      test: ["CMD", "curl", "-sSf", "http://localhost:4000/health"]
+      timeout: 10s
+      interval: 10s
+      start_period: 120s
+      retries: 30
+
+  db:
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      start_period: 60s
+      retries: 10
+
+  studio:
+    # Pre-built image from CI (pushed on every merge to master)
+    image: ghcr.io/zbcoding/superbase2-studio:latest
+    # To build from source instead, comment out the image line above and uncomment:
+    # build:
+    #   context: ..
+    #   dockerfile: apps/studio/Dockerfile
+    #   target: production
+    # image: supabase/studio:superbase2-local
+    depends_on:
+      superbase2-init:
+        condition: service_completed_successfully
+      sb2-agent:
+        condition: service_healthy
+    environment:
+      SUPERBASE2_ENABLED: "true"
+      SUPERBASE2_MANIFEST: /etc/superbase2/projects.json
+      SUPERBASE2_COMPOSE_FILE: /etc/superbase2/docker-compose.yml
+      SUPERBASE2_COMPOSE_CMD: "docker compose -f docker-compose.yml -f docker-compose.superbase2.yml"
+      SB2_AGENT_URL: http://sb2-agent:8088
+      SB2_AGENT_TOKEN: ${SB2_AGENT_TOKEN}
+    volumes:
+      - ${SUPERBASE2_DIR:-./superbase2}/projects.json:/etc/superbase2/projects.json:z
+      - ./docker-compose.yml:/etc/superbase2/docker-compose.yml:ro,z
+
+  # ─── SuperBase² Agent ─────────────────────────────────────────────────────
+  # Host-Docker broker so Studio can start/stop/restart per-project stacks
+  # without requiring the user to SSH in and run superbase2.sh manually.
+  # Only reachable on the internal compose network.
+  sb2-agent:
+    container_name: supabase-sb2-agent
+    build:
+      context: ./superbase2/agent
+      dockerfile: Dockerfile
+    image: superbase2/sb2-agent:local
+    # Never attempt a registry pull — this image is always built locally.
+    pull_policy: build
+    restart: unless-stopped
+    environment:
+      SB2_AGENT_TOKEN: ${SB2_AGENT_TOKEN}
+      SB2_AGENT_PORT: 8088
+      SB2_DOCKER_DIR: /workspace
+    volumes:
+      - ${DOCKER_SOCKET_LOCATION:-/var/run/docker.sock}:/var/run/docker.sock:z
+      - .:/workspace:z
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8088/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    security_opt:
+      - "label=disable"
+
+  # One-shot init container that ensures the manifest file exists on the host.
+  # Uses the same bind mount so the file is created on the host filesystem,
+  # keeping CLI (superbase2.sh) and Studio in sync.
+  superbase2-init:
+    image: alpine:3.19
+    restart: "no"
+    environment:
+      JWT_SECRET: ${JWT_SECRET}
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+    volumes:
+      - ${SUPERBASE2_DIR:-./superbase2}/projects.json:/etc/superbase2/projects.json:z
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        # Fail fast if JWT_SECRET doesn't match the signature on ANON_KEY /
+        # SERVICE_ROLE_KEY. Without this guard, kong/auth/postgrest accept
+        # the keys but the dashboard's admin endpoints (which always go via
+        # JWT verification at gotrue) silently 403 with "bad_jwt".
+        apk add --no-cache openssl >/dev/null
+        verify_jwt() {
+          name=$$1; jwt=$$2; secret=$$3
+          if [ -z "$$jwt" ] || [ -z "$$secret" ]; then
+            echo "[SuperBase²] FATAL: $$name or JWT_SECRET is empty"; return 1
+          fi
+          hp=$${jwt%.*}; sig=$${jwt##*.}
+          expected=$$(printf '%s' "$$hp" | openssl dgst -binary -sha256 -hmac "$$secret" \
+            | openssl enc -base64 -A | tr '+/' '-_' | tr -d '=')
+          if [ "$$sig" != "$$expected" ]; then
+            echo "[SuperBase²] FATAL: $$name signature does not match JWT_SECRET."
+            echo "  Likely cause: JWT_SECRET was changed in env without re-issuing the keys."
+            echo "  Fix: regenerate ANON_KEY and SERVICE_ROLE_KEY with utils/generate-keys.sh"
+            echo "  (or restore the original JWT_SECRET) and redeploy."
+            return 1
+          fi
+        }
+        verify_jwt ANON_KEY "$$ANON_KEY" "$$JWT_SECRET" || exit 1
+        verify_jwt SERVICE_ROLE_KEY "$$SERVICE_ROLE_KEY" "$$JWT_SECRET" || exit 1
+        echo "[SuperBase²] JWT keys verified against JWT_SECRET"
+
+        if [ ! -s /etc/superbase2/projects.json ]; then
+          echo '{ "projects": [] }' > /etc/superbase2/projects.json
+          echo "[SuperBase²] Initialized empty projects manifest"
+        else
+          echo "[SuperBase²] Projects manifest already exists"
+        fi
+        chmod 600 /etc/superbase2/projects.json
+
+  # One-shot init container that injects per-project Kong routes.
+  # The upstream kong-init only writes the base kong.yml (no /project/<ref>/*
+  # paths). Without this, every Coolify redeploy wipes the per-project routes
+  # and all project API calls return 404 until someone manually runs
+  # rebuild-kong. This container runs rebuild-kong on every Kong start so
+  # the routes are always present.
+  kong-sb2-init:
+    image: superbase2/sb2-agent:local
+    # Never attempt a registry pull — this image is always built locally.
+    pull_policy: build
+    build:
+      context: ./superbase2/agent
+      dockerfile: Dockerfile
+    restart: "no"
+    # Disable the sb2-agent image's baked-in HEALTHCHECK (probes :8088, which
+    # this one-shot container never binds). Without this override compose marks
+    # the container `unhealthy` forever and `--wait` aborts the deploy before
+    # kong/functions ever leave `Created`.
+    healthcheck:
+      disable: true
+    depends_on:
+      kong-init:
+        condition: service_completed_successfully
+    environment:
+      # Without this, superbase2.sh defaults STATE_DIR to its own SCRIPT_DIR
+      # and looks for projects under /workspace/superbase2/projects — but the
+      # state volume is mounted one level deeper. The mismatch makes
+      # list_projects return nothing, rebuild-kong writes a base-only config,
+      # and the per-project /project/<ref>/* routes silently disappear on
+      # every restart until rebuild-kong is re-run from sb2-agent (which
+      # does set this env var).
+      SB2_STATE_DIR: /workspace/superbase2/state
+    volumes:
+      - ${DOCKER_SOCKET_LOCATION:-/var/run/docker.sock}:/var/run/docker.sock:z
+      - superbase2-config:/workspace/superbase2/state
+      - kong-config:/workspace/volumes/api
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        # Wait for Kong to be up so rebuild-kong can restart it
+        echo "[kong-sb2-init] Waiting for Kong to start..."
+        until curl -sS -o /dev/null --max-time 5 http://kong:8000/ 2>/dev/null; do
+          sleep 2
+        done
+        echo "[kong-sb2-init] Kong is up, rebuilding per-project routes..."
+        cd /workspace/superbase2
+        bash superbase2.sh rebuild-kong
+        echo "[kong-sb2-init] Done"
