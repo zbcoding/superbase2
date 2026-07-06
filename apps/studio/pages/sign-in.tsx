@@ -12,7 +12,7 @@ import { useCustomContent } from '@/hooks/custom-content/useCustomContent'
 import { useEnabledIdentityProviders } from '@/hooks/misc/useEnabledIdentityProviders'
 import { useInboundBranding } from '@/hooks/misc/useInboundBranding'
 import { useIsFeatureEnabled } from '@/hooks/misc/useIsFeatureEnabled'
-import { IS_PLATFORM } from '@/lib/constants'
+import { IS_PLATFORM, SUPERBASE2_ENABLED } from '@/lib/constants'
 import { getSignUpReturnTo } from '@/lib/gotrue'
 import type { NextPageWithLayout } from '@/types'
 
@@ -44,8 +44,9 @@ const SignInPage: NextPageWithLayout = () => {
 
   useEffect(() => {
     if (!IS_PLATFORM) {
-      // on selfhosted instance just redirect to projects page
-      router.replace('/project/default')
+      // on selfhosted instance just redirect to projects page.
+      // SB2 has no `default` ref so route to org home instead of /project/default.
+      router.replace(SUPERBASE2_ENABLED ? '/organizations' : '/project/default')
     }
   }, [router])
 

@@ -2,6 +2,7 @@ version: "3.8"
 
 services:
   studio:
+    # Dev builds from source for hot-reload. For production, use ghcr.io/zbcoding/superbase2-studio:latest
     build:
       context: ..
       dockerfile: apps/studio/Dockerfile

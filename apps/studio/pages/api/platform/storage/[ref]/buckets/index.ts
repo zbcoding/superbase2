@@ -1,9 +1,13 @@
 import { NextApiRequest, NextApiResponse } from 'next'
 
 import { apiWrapper } from '@/lib/api/apiWrapper'
-import { selfHostedSupabaseAdmin as supabase } from '@/lib/api/self-hosted-admin'
+import { requireAuth } from '@/lib/superbase2/auth'
+import { getStorageClient } from '@/lib/superbase2/storage-client'
 
-export default (req: NextApiRequest, res: NextApiResponse) => apiWrapper(req, res, handler)
+export default async (req: NextApiRequest, res: NextApiResponse) => {
+  if (!(await requireAuth(req, res))) return
+  return apiWrapper(req, res, handler)
+}
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   const { method } = req
@@ -22,6 +26,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
 const handleGet = async (req: NextApiRequest, res: NextApiResponse) => {
   const { limit, offset, search, sortColumn, sortOrder } = parseStoragePaginationParams(req)
+  const supabase = getStorageClient(req)
 
   const { data, error } = await supabase.storage.listBuckets({
     ...(limit ? { limit } : {}),
@@ -31,7 +36,14 @@ const handleGet = async (req: NextApiRequest, res: NextApiResponse) => {
     ...(sortOrder ? { sortOrder } : {}),
   })
   if (error) {
-    return res.status(500).json({ error: { message: 'Internal Server Error' } })
+    console.error('[SB2] listBuckets failed for ref', req.query.ref, error)
+    return res.status(500).json({
+      error: {
+        message: error.message || 'Internal Server Error',
+        name: (error as any).name,
+        status: (error as any).status,
+      },
+    })
   }
 
   return res.status(200).json(data)
@@ -44,6 +56,7 @@ const handlePost = async (req: NextApiRequest, res: NextApiResponse) => {
     allowed_mime_types: allowedMimeTypes,
     file_size_limit: fileSizeLimit,
   } = req.body
+  const supabase = getStorageClient(req)
 
   const { data, error } = await supabase.storage.createBucket(id, {
     public: isPublicBucket,

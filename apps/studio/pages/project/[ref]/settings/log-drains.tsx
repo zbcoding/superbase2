@@ -195,7 +195,8 @@ const LogDrainsSettings: NextPageWithLayout = () => {
   )
 
   // [kemal]: Ordinarily <PageLayout /> would be bundled with the getLayout function below, however in this case we need access to some bits for the "Add destination" button to render as part of the in-built page header in <PageLayout />.
-  if (!isLoadingEntitlement && hasAccessToLogDrains) {
+  // sb2: also wrap while the entitlement check loads, so the page doesn't reflow from bare content to PageLayout
+  if (isLoadingEntitlement || hasAccessToLogDrains) {
     return (
       <PageLayout
         title="Log Drains"

@@ -5,6 +5,15 @@ export * from './infrastructure'
 export const IS_PLATFORM = process.env.NEXT_PUBLIC_IS_PLATFORM === 'true'
 
 /**
+ * SuperBase² multi-project mode. Defaults to enabled — set to "false" to
+ * disable. The UI uses this to pick the right "home" route (org list vs
+ * `/project/default`), since the legacy `default` ref is not a valid SB2
+ * project ref and would 400 against the SB2 API handlers.
+ */
+export const SUPERBASE2_ENABLED =
+  process.env.NEXT_PUBLIC_SUPERBASE2_ENABLED !== 'false'
+
+/**
  * Server-side flag for Supabase CLI (local development) runs. Detected via
  * CURRENT_CLI_VERSION, which the CLI sets when launching Studio. The browser
  * cannot read this directly — use the /platform/deployment-mode endpoint.

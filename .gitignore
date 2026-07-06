@@ -126,6 +126,8 @@ next-env.d.ts
 !.claude/skills
 .agents/skills/me-*
 CLAUDE.local.md
+.letta
+.deepseek
 
 #include template .env file for docker-compose
 !docker/.env
@@ -171,3 +173,4 @@ examples/**/pnpm-lock.yaml
 
 # local-only lockfile for the mcp-server registry block
 apps/ui-library/registry/default/blocks/mcp-server/supabase/functions/mcp-server/deno.lock
+.osgrep

@@ -10,6 +10,7 @@ export type QueryOptions = {
   parameters?: unknown[]
   readOnly?: boolean
   headers?: HeadersInit
+  ref?: string | string[]
 }
 
 /**
@@ -22,10 +23,11 @@ export async function executeQuery<T = unknown>({
   parameters,
   readOnly = false,
   headers,
+  ref,
 }: QueryOptions): Promise<WrappedResult<T[]>> {
   assertSelfHosted()
 
-  const connectionString = getConnectionString({ readOnly })
+  const connectionString = getConnectionString({ ref, readOnly })
   const connectionStringEncrypted = encryptString(connectionString)
 
   const requestBody: { query: string; parameters?: unknown[] } = { query }

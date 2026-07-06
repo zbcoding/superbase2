@@ -1,0 +1,1057 @@
+# SuperBase² — single-file Coolify deployment.
+#
+# This is a merged version of docker-compose.yml + docker-compose.superbase2.yml
+# for Coolify, which expects a single compose file.
+#
+# Coolify settings:
+#   Base directory:           /docker
+#   Docker Compose Location:  /docker/docker-compose.coolify.yml
+#
+# ── Environment variables ──
+#
+# Generate all variables with:  sh utils/generate-keys.sh --coolify
+#
+# Every ${VAR:-default} in this file is visible to Coolify's env panel.
+# All variables have safe defaults — blank values will NOT break anything.
+# Override only what you need.
+#
+# Full reference: docker/.env.example
+#
+# ── Changes vs upstream docker-compose.yml ──
+# • studio: uses pre-built ghcr.io image (built by CI on every push to master)
+# • studio: adds SUPERBASE2_* env vars and manifest volume mount
+# • superbase2-init: one-shot container that bootstraps projects.json
+#
+
+name: supabase
+
+services:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Studio — SuperBase² build (merged overlay)
+  # ────────────────────────────────────────────────────────────────────────────
+  studio:
+    container_name: supabase-studio
+    image: ghcr.io/zbcoding/superbase2-studio:latest
+    pull_policy: always
+    restart: unless-stopped
+    expose:
+      - 3000
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:3000/api/superbase2/health').then((r) => {if (r.status !== 200) throw new Error(r.status)})"
+        ]
+      timeout: 10s
+      interval: 5s
+      retries: 3
+    depends_on:
+      analytics:
+        condition: service_started
+      superbase2-init:
+        condition: service_completed_successfully
+      sb2-agent:
+        condition: service_healthy
+    environment:
+      HOSTNAME: "::"
+
+      STUDIO_PG_META_URL: http://meta:8080
+      POSTGRES_PORT: 5432
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PG_META_CRYPTO_KEY: ${PG_META_CRYPTO_KEY}
+      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS:-public,storage,graphql_public}
+      PGRST_DB_MAX_ROWS: ${PGRST_DB_MAX_ROWS:-1000}
+      PGRST_DB_EXTRA_SEARCH_PATH: ${PGRST_DB_EXTRA_SEARCH_PATH:-public}
+
+      DEFAULT_ORGANIZATION_NAME: ${STUDIO_DEFAULT_ORGANIZATION:-Default Organization}
+      DEFAULT_PROJECT_NAME: ${STUDIO_DEFAULT_PROJECT:-Default Project}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+
+      LOGFLARE_API_KEY: ${LOGFLARE_PUBLIC_ACCESS_TOKEN}
+      LOGFLARE_PUBLIC_ACCESS_TOKEN: ${LOGFLARE_PUBLIC_ACCESS_TOKEN}
+      LOGFLARE_PRIVATE_ACCESS_TOKEN: ${LOGFLARE_PRIVATE_ACCESS_TOKEN}
+
+      LOGFLARE_URL: http://analytics:4000
+      NEXT_PUBLIC_ENABLE_LOGS: true
+      NEXT_PUBLIC_SUPABASE_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${ANON_KEY}
+      NEXT_ANALYTICS_BACKEND_PROVIDER: postgres
+      SNIPPETS_MANAGEMENT_FOLDER: /app/snippets
+      EDGE_FUNCTIONS_MANAGEMENT_FOLDER: /app/edge-functions
+
+      # ── SuperBase² ──
+      SUPERBASE2_ENABLED: ${SUPERBASE2_ENABLED:-true}
+      # App-layer basic-auth (defense-in-depth) + the credentials it checks.
+      # Requires the Kong dashboard route to use hide_credentials: false so the
+      # Authorization header reaches Studio (set in templates/kong-base.yml.tpl).
+      SUPERBASE2_AUTH: ${SUPERBASE2_AUTH:-true}
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-supabase}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
+      # Mirror to client so the dashboard knows the legacy `default` project ref
+      # is not valid in SB2 mode and routes /, /sign-in, /project/default to the
+      # org-scoped multi-project home (avoids the redirect-loop that produces
+      # "You do not have access to this project" after basic-HTTP login).
+      NEXT_PUBLIC_SUPERBASE2_ENABLED: ${SUPERBASE2_ENABLED:-true}
+      SUPERBASE2_MANIFEST: /etc/superbase2/projects.json
+      SUPERBASE2_COMPOSE_FILE: /etc/superbase2/docker-compose.yml
+      SUPERBASE2_COMPOSE_CMD: "docker compose -f docker-compose.coolify.yml"
+      # ── SuperBase² Agent (enables UI-driven project lifecycle controls) ──
+      SB2_AGENT_URL: ${SB2_AGENT_URL:-http://sb2-agent:8088}
+      SB2_AGENT_TOKEN: ${SB2_AGENT_TOKEN}
+      NEXT_PUBLIC_GOTRUE_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}/auth/v1
+    volumes:
+      - ./volumes/snippets:/app/snippets:Z
+      - functions-data:/app/edge-functions:Z
+      # ── SuperBase² ──
+      - superbase2-config:/etc/superbase2:z
+      # Bind-mount the Coolify working-copy compose so the upgrade endpoint
+      # can read current image tags at runtime. Coolify saves its processed
+      # compose as docker-compose.yaml in the application directory, so this
+      # mount is always the live deployed file.
+      - ./docker-compose.yaml:/etc/superbase2/docker-compose.yml:ro,z
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # SuperBase² Agent — host-Docker broker for UI-driven project lifecycle.
+  # Lets Studio start/stop/restart per-project stacks without SSH.
+  # Only reachable on the internal compose network.
+  # ────────────────────────────────────────────────────────────────────────────
+  sb2-agent:
+    container_name: supabase-sb2-agent
+    build:
+      context: ./superbase2
+      dockerfile: agent/Dockerfile
+    image: superbase2/sb2-agent:local
+    pull_policy: build
+    restart: unless-stopped
+    environment:
+      SB2_AGENT_TOKEN: ${SB2_AGENT_TOKEN}
+      SB2_AGENT_PORT: 8088
+      SB2_DOCKER_DIR: /workspace
+      # Share Studio's manifest + per-project disk state via the same named
+      # volume Studio uses (/etc/superbase2 there, /workspace/superbase2/state
+      # here — superbase2.sh reads SB2_STATE_DIR).
+      SB2_STATE_DIR: /workspace/superbase2/state
+      SUPERBASE2_COMPOSE_CMD: "docker compose -f docker-compose.coolify.yml"
+      # Shared infra creds — previously sourced from /workspace/.env. In the
+      # agent container there is no .env to read, so pipe them through here.
+      # Every per-project compose file references these via ${...} expansion.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: ${POSTGRES_HOST:-db}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      JWT_EXPIRY: ${JWT_EXPIRY:-3600}
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}
+      API_EXTERNAL_URL: ${API_EXTERNAL_URL:-http://localhost:8000}
+      SITE_URL: ${SITE_URL:-http://localhost:3000}
+      ADDITIONAL_REDIRECT_URLS: ${ADDITIONAL_REDIRECT_URLS:-}
+      DISABLE_SIGNUP: ${DISABLE_SIGNUP:-false}
+      ENABLE_EMAIL_SIGNUP: ${ENABLE_EMAIL_SIGNUP:-true}
+      ENABLE_EMAIL_AUTOCONFIRM: ${ENABLE_EMAIL_AUTOCONFIRM:-false}
+      ENABLE_PHONE_SIGNUP: ${ENABLE_PHONE_SIGNUP:-true}
+      ENABLE_PHONE_AUTOCONFIRM: ${ENABLE_PHONE_AUTOCONFIRM:-true}
+      ENABLE_ANONYMOUS_USERS: ${ENABLE_ANONYMOUS_USERS:-false}
+      SMTP_ADMIN_EMAIL: ${SMTP_ADMIN_EMAIL:-admin@example.com}
+      SMTP_HOST: ${SMTP_HOST:-supabase-mail}
+      SMTP_PORT: ${SMTP_PORT:-2500}
+      SMTP_USER: ${SMTP_USER:-fake_mail_user}
+      SMTP_PASS: ${SMTP_PASS:-fake_mail_password}
+      SMTP_SENDER_NAME: ${SMTP_SENDER_NAME:-fake_sender}
+      MAILER_URLPATHS_CONFIRMATION: ${MAILER_URLPATHS_CONFIRMATION:-/auth/v1/verify}
+      MAILER_URLPATHS_INVITE: ${MAILER_URLPATHS_INVITE:-/auth/v1/verify}
+      MAILER_URLPATHS_RECOVERY: ${MAILER_URLPATHS_RECOVERY:-/auth/v1/verify}
+      MAILER_URLPATHS_EMAIL_CHANGE: ${MAILER_URLPATHS_EMAIL_CHANGE:-/auth/v1/verify}
+      GLOBAL_S3_BUCKET: ${GLOBAL_S3_BUCKET:-stub}
+      REGION: ${REGION:-local}
+      IMGPROXY_ENABLE_WEBP_DETECTION: ${IMGPROXY_ENABLE_WEBP_DETECTION:-true}
+      FUNCTIONS_VERIFY_JWT: ${FUNCTIONS_VERIFY_JWT:-true}
+      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS:-public,storage,graphql_public}
+      PGRST_DB_MAX_ROWS: ${PGRST_DB_MAX_ROWS:-1000}
+      PGRST_DB_EXTRA_SEARCH_PATH: ${PGRST_DB_EXTRA_SEARCH_PATH:-public,extensions}
+    volumes:
+      - ${DOCKER_SOCKET_LOCATION:-/var/run/docker.sock}:/var/run/docker.sock:z
+      - superbase2-config:/workspace/superbase2/state
+      # Kong's config volume — superbase2.sh rebuilds kong.yml per-project and
+      # runs `docker exec supabase-kong kong reload`, so it needs write access
+      # to the same files Kong reads.
+      - kong-config:/workspace/volumes/api
+      # /workspace/superbase2/superbase2.sh + templates are baked into the image
+      # via the Dockerfile (no bind-mount — Coolify's build dir is ephemeral).
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8088/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    security_opt:
+      - "label=disable"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # SuperBase² Init — one-shot container that ensures the manifest file exists
+  # ────────────────────────────────────────────────────────────────────────────
+  superbase2-init:
+    image: alpine:3.19
+    restart: "no"
+    environment:
+      JWT_SECRET: ${JWT_SECRET}
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+    volumes:
+      - superbase2-config:/etc/superbase2
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        # Fail fast if JWT_SECRET doesn't match the signature on ANON_KEY /
+        # SERVICE_ROLE_KEY. Without this guard, kong/auth/postgrest accept
+        # the keys but the dashboard's admin endpoints (which always go via
+        # JWT verification at gotrue) silently 403 with "bad_jwt".
+        apk add --no-cache openssl >/dev/null
+        verify_jwt() {
+          name=$$1; jwt=$$2; secret=$$3
+          if [ -z "$$jwt" ] || [ -z "$$secret" ]; then
+            echo "[SuperBase²] FATAL: $$name or JWT_SECRET is empty"; return 1
+          fi
+          hp=$${jwt%.*}; sig=$${jwt##*.}
+          expected=$$(printf '%s' "$$hp" | openssl dgst -binary -sha256 -hmac "$$secret" \
+            | openssl enc -base64 -A | tr '+/' '-_' | tr -d '=')
+          if [ "$$sig" != "$$expected" ]; then
+            echo "[SuperBase²] FATAL: $$name signature does not match JWT_SECRET."
+            echo "  Likely cause: JWT_SECRET was changed in env without re-issuing the keys."
+            echo "  Fix: regenerate ANON_KEY and SERVICE_ROLE_KEY with utils/generate-keys.sh"
+            echo "  (or restore the original JWT_SECRET) and redeploy."
+            return 1
+          fi
+        }
+        verify_jwt ANON_KEY "$$ANON_KEY" "$$JWT_SECRET" || exit 1
+        verify_jwt SERVICE_ROLE_KEY "$$SERVICE_ROLE_KEY" "$$JWT_SECRET" || exit 1
+        echo "[SuperBase²] JWT keys verified against JWT_SECRET"
+
+        mkdir -p /etc/superbase2/projects
+        if [ ! -s /etc/superbase2/projects.json ]; then
+          echo '{ "projects": [] }' > /etc/superbase2/projects.json
+          echo "[SuperBase²] Initialized empty projects manifest"
+        else
+          echo "[SuperBase²] Projects manifest already exists"
+        fi
+        chmod 600 /etc/superbase2/projects.json
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Kong init — copies baked configs from sb2-agent image into the shared volume.
+  # Configs live at /opt/sb2-configs/kong/{kong-entrypoint.sh,temp.yml} in the
+  # image so the compose file stays small (Coolify ARG_MAX limit).
+  # ────────────────────────────────────────────────────────────────────────────
+  kong-init:
+    image: superbase2/sb2-agent:local
+    pull_policy: build
+    build:
+      context: ./superbase2
+      dockerfile: agent/Dockerfile
+    restart: "no"
+    volumes:
+      - kong-config:/home/kong
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        cp /opt/sb2-configs/kong/kong-entrypoint.sh /home/kong/kong-entrypoint.sh
+        cp /opt/sb2-configs/kong/temp.yml /home/kong/temp.yml
+        chmod +x /home/kong/kong-entrypoint.sh
+        echo "[kong-init] Config files written"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Kong SB2 init — injects per-project routes into the Kong config volume
+  # ────────────────────────────────────────────────────────────────────────────
+  kong-sb2-init:
+    image: superbase2/sb2-agent:local
+    pull_policy: build
+    build:
+      context: ./superbase2
+      dockerfile: agent/Dockerfile
+    restart: "no"
+    # Disable the sb2-agent image's baked-in HEALTHCHECK (probes :8088, which
+    # this one-shot container never binds). Without this override compose marks
+    # the container `unhealthy` forever and `--wait` aborts the deploy before
+    # kong/functions ever leave `Created`.
+    healthcheck:
+      disable: true
+    depends_on:
+      kong-init:
+        condition: service_completed_successfully
+    environment:
+      # Without this, superbase2.sh defaults STATE_DIR to its own SCRIPT_DIR
+      # (/workspace/superbase2) and looks for projects under .../projects —
+      # but the state volume is mounted one level deeper at .../state. The
+      # mismatch makes list_projects return nothing, rebuild-kong writes a
+      # base-only config, and every Coolify redeploy silently strips the
+      # per-project /project/<ref>/* routes (auth/rest/realtime/storage all
+      # 404) until someone manually re-runs rebuild-kong via sb2-agent.
+      SB2_STATE_DIR: /workspace/superbase2/state
+    volumes:
+      - ${DOCKER_SOCKET_LOCATION:-/var/run/docker.sock}:/var/run/docker.sock:z
+      - superbase2-config:/workspace/superbase2/state
+      - kong-config:/workspace/volumes/api
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        echo "[kong-sb2-init] Waiting for Kong to start..."
+        until curl -sS -o /dev/null --max-time 5 http://kong:8000/ 2>/dev/null; do
+          sleep 2
+        done
+        echo "[kong-sb2-init] Kong is up, rebuilding per-project routes..."
+        cd /workspace/superbase2
+        bash superbase2.sh rebuild-kong
+        echo "[kong-sb2-init] Done"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Kong — API Gateway
+  # ────────────────────────────────────────────────────────────────────────────
+  kong:
+    container_name: supabase-kong
+    image: kong/kong:3.9.1
+    restart: unless-stopped
+    networks:
+      default:
+        aliases:
+          - api-gw
+    healthcheck:
+      # TCP probe via bash /dev/tcp — Kong's image has no curl/wget, and
+      # `kong health` only checks nginx liveness (flips green before the proxy
+      # accepts traffic). Opening a socket to :8000 proves the proxy is bound.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8000'"]
+      interval: 10s
+      timeout: 6s
+      start_period: 30s
+      retries: 6
+    labels:
+      - coolify.healthcheck.enabled=true
+      # Pin Traefik to Kong's coolify-network IP. Without this, Traefik's
+      # Docker provider picks non-deterministically from all of Kong's network
+      # IPs; the auto-created _default network IP is unreachable from Traefik,
+      # causing intermittent 504s after every redeploy.
+      - traefik.docker.network=coolify
+    depends_on:
+      studio:
+        condition: service_healthy
+      kong-init:
+        condition: service_completed_successfully
+    expose:
+      - 8000
+    volumes:
+      - kong-config:/home/kong:ro
+      #- ./volumes/api/server.crt:/home/kong/server.crt:ro
+      #- ./volumes/api/server.key:/home/kong/server.key:ro
+    environment:
+      KONG_PORT_MAPS: "443:8000"
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /usr/local/kong/kong.yml
+      # https://github.com/supabase/cli/issues/14
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_DNS_NOT_FOUND_TTL: 1
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth,request-termination,ip-restriction,post-function
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+      KONG_PROXY_ACCESS_LOG: /dev/stdout combined
+      #KONG_SSL_CERT: /home/kong/server.crt
+      #KONG_SSL_CERT_KEY: /home/kong/server.key
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-supabase}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
+    entrypoint: /home/kong/kong-entrypoint.sh
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Auth — GoTrue
+  # ────────────────────────────────────────────────────────────────────────────
+  auth:
+    container_name: supabase-auth
+    image: supabase/gotrue:v2.186.0
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://localhost:9999/health"
+        ]
+      timeout: 5s
+      interval: 5s
+      retries: 3
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}
+      GOTRUE_API_EXTERNAL_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}
+
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@db:5432/postgres
+
+      GOTRUE_SITE_URL: ${SITE_URL:-http://localhost:3000}
+      GOTRUE_URI_ALLOW_LIST: ${ADDITIONAL_REDIRECT_URLS:-}
+      GOTRUE_DISABLE_SIGNUP: ${DISABLE_SIGNUP:-false}
+
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: ${JWT_EXPIRY:-3600}
+
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: ${ENABLE_EMAIL_SIGNUP:-true}
+      GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED: ${ENABLE_ANONYMOUS_USERS:-false}
+      GOTRUE_MAILER_AUTOCONFIRM: ${ENABLE_EMAIL_AUTOCONFIRM:-false}
+
+      GOTRUE_SMTP_ADMIN_EMAIL: ${SMTP_ADMIN_EMAIL:-admin@example.com}
+      GOTRUE_SMTP_HOST: ${SMTP_HOST:-supabase-mail}
+      GOTRUE_SMTP_PORT: ${SMTP_PORT:-2500}
+      GOTRUE_SMTP_USER: ${SMTP_USER:-fake_mail_user}
+      GOTRUE_SMTP_PASS: ${SMTP_PASS:-fake_mail_password}
+      GOTRUE_SMTP_SENDER_NAME: ${SMTP_SENDER_NAME:-fake_sender}
+      GOTRUE_MAILER_URLPATHS_INVITE: ${MAILER_URLPATHS_INVITE:-/auth/v1/verify}
+      GOTRUE_MAILER_URLPATHS_CONFIRMATION: ${MAILER_URLPATHS_CONFIRMATION:-/auth/v1/verify}
+      GOTRUE_MAILER_URLPATHS_RECOVERY: ${MAILER_URLPATHS_RECOVERY:-/auth/v1/verify}
+      GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: ${MAILER_URLPATHS_EMAIL_CHANGE:-/auth/v1/verify}
+
+      GOTRUE_EXTERNAL_PHONE_ENABLED: ${ENABLE_PHONE_SIGNUP:-true}
+      GOTRUE_SMS_AUTOCONFIRM: ${ENABLE_PHONE_AUTOCONFIRM:-true}
+
+      # To enable OAuth providers, uncomment and fill in your credentials:
+      # GOTRUE_EXTERNAL_GOOGLE_ENABLED: "true"
+      # GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID: your-google-client-id
+      # GOTRUE_EXTERNAL_GOOGLE_SECRET: your-google-secret
+      # GOTRUE_EXTERNAL_GOOGLE_REDIRECT_URI: https://supabase.yourdomain.com/auth/v1/callback
+
+      # GOTRUE_EXTERNAL_GITHUB_ENABLED: "true"
+      # GOTRUE_EXTERNAL_GITHUB_CLIENT_ID: your-github-client-id
+      # GOTRUE_EXTERNAL_GITHUB_SECRET: your-github-secret
+      # GOTRUE_EXTERNAL_GITHUB_REDIRECT_URI: https://supabase.yourdomain.com/auth/v1/callback
+
+      # GOTRUE_EXTERNAL_AZURE_ENABLED: "true"
+      # GOTRUE_EXTERNAL_AZURE_CLIENT_ID: your-azure-client-id
+      # GOTRUE_EXTERNAL_AZURE_SECRET: your-azure-secret
+      # GOTRUE_EXTERNAL_AZURE_REDIRECT_URI: https://supabase.yourdomain.com/auth/v1/callback
+
+      # To configure SMS delivery (phone auth and phone MFA):
+      # GOTRUE_SMS_PROVIDER: twilio
+      # GOTRUE_SMS_OTP_EXP: 60
+      # GOTRUE_SMS_OTP_LENGTH: 6
+      # GOTRUE_SMS_MAX_FREQUENCY: 60s
+      # GOTRUE_SMS_TEMPLATE: "Your code is {{ .Code }}"
+
+      # Twilio credentials (when SMS_PROVIDER=twilio)
+      # GOTRUE_SMS_TWILIO_ACCOUNT_SID: your-twilio-account-sid
+      # GOTRUE_SMS_TWILIO_AUTH_TOKEN: your-twilio-auth-token
+      # GOTRUE_SMS_TWILIO_MESSAGE_SERVICE_SID: your-twilio-message-service-sid
+
+      # Test OTP mappings for development
+      # GOTRUE_SMS_TEST_OTP: ""
+
+      # To configure multi-factor authentication (MFA):
+      # GOTRUE_MFA_TOTP_ENROLL_ENABLED: "true"
+      # GOTRUE_MFA_TOTP_VERIFY_ENABLED: "true"
+      # GOTRUE_MFA_PHONE_ENROLL_ENABLED: "true"
+      # GOTRUE_MFA_PHONE_VERIFY_ENABLED: "true"
+      # GOTRUE_MFA_MAX_ENROLLED_FACTORS: 10
+
+      # Uncomment to enable custom access token hook.
+      # See: https://supabase.com/docs/guides/auth/auth-hooks for
+      # full list of hooks and additional details about custom_access_token_hook
+
+      # GOTRUE_HOOK_CUSTOM_ACCESS_TOKEN_ENABLED: "true"
+      # GOTRUE_HOOK_CUSTOM_ACCESS_TOKEN_URI: "pg-functions://postgres/public/custom_access_token_hook"
+      # GOTRUE_HOOK_CUSTOM_ACCESS_TOKEN_SECRETS: "<standard-base64-secret>"
+
+      # GOTRUE_HOOK_MFA_VERIFICATION_ATTEMPT_ENABLED: "true"
+      # GOTRUE_HOOK_MFA_VERIFICATION_ATTEMPT_URI: "pg-functions://postgres/public/mfa_verification_attempt"
+
+      # GOTRUE_HOOK_PASSWORD_VERIFICATION_ATTEMPT_ENABLED: "true"
+      # GOTRUE_HOOK_PASSWORD_VERIFICATION_ATTEMPT_URI: "pg-functions://postgres/public/password_verification_attempt"
+
+      # GOTRUE_HOOK_SEND_SMS_ENABLED: "false"
+      # GOTRUE_HOOK_SEND_SMS_URI: "pg-functions://postgres/public/custom_access_token_hook"
+      # GOTRUE_HOOK_SEND_SMS_SECRETS: "v1,whsec_VGhpcyBpcyBhbiBleGFtcGxlIG9mIGEgc2hvcnRlciBCYXNlNjQgc3RyaW5n"
+
+      # GOTRUE_HOOK_SEND_EMAIL_ENABLED: "false"
+      # GOTRUE_HOOK_SEND_EMAIL_URI: "http://host.docker.internal:54321/functions/v1/email_sender"
+      # GOTRUE_HOOK_SEND_EMAIL_SECRETS: "v1,whsec_VGhpcyBpcyBhbiBleGFtcGxlIG9mIGEgc2hvcnRlciBCYXNlNjQgc3RyaW5n"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # REST — PostgREST
+  # ────────────────────────────────────────────────────────────────────────────
+  rest:
+    container_name: supabase-rest
+    image: postgrest/postgrest:v14.6
+    restart: unless-stopped
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@db:5432/postgres
+      PGRST_DB_SCHEMAS: public,storage,graphql_public
+      PGRST_DB_MAX_ROWS: 1000
+      PGRST_DB_EXTRA_SEARCH_PATH: public
+      PGRST_DB_ANON_ROLE: anon
+      # PostgREST accepts a plain-text symmetric secret, a single JWK, or a JWKS.
+      # Do NOT set JWT_JWKS unless it contains valid JWKS JSON — empty string will crash.
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_EXP: 3600
+    command:
+      [
+        "postgrest"
+      ]
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Realtime
+  # ────────────────────────────────────────────────────────────────────────────
+  realtime:
+    # This container name looks inconsistent but is correct because realtime constructs tenant id by parsing the subdomain
+    container_name: realtime-dev.supabase-realtime
+    image: supabase/realtime:v2.76.5
+    restart: unless-stopped
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+    healthcheck:
+      # Upstream check requires the `realtime-dev` tenant to be seeded and auths
+      # with ANON_KEY. It fails on fresh SB2 deploys before any tenant exists.
+      # Use a simple TCP port probe instead — Realtime is healthy if it's listening.
+      # Portable port-listen probe: 4000 == 0x0FA0 in /proc/net/tcp. Works in any
+      # shell (sh/bash/dash/busybox) and on any base image with /proc — no /dev/tcp,
+      # no curl/nc/bash dependency. awk pins the state to the 4th column (LISTEN
+      # = 0x0A) so we don't accidentally match a local-address suffix or an EOL
+      # without a trailing space the way `grep ' 0A '` would.
+      test: ["CMD-SHELL", "awk '$2 ~ /:0FA0$/ && $4 == \"0A\" {f=1} END{exit !f}' /proc/net/tcp /proc/net/tcp6"]
+      timeout: 5s
+      interval: 15s
+      retries: 10
+      start_period: 90s
+    environment:
+      PORT: 4000
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: supabase_admin
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: postgres
+      DB_AFTER_CONNECT_QUERY: 'SET search_path TO _realtime'
+      DB_ENC_KEY: ${DB_ENC_KEY}
+
+      # Legacy symmetric HS256 key
+      API_JWT_SECRET: ${JWT_SECRET}
+
+      # JWKS for token verification (EC public + legacy symmetric)
+      # To enable, uncomment and set to valid JWKS JSON
+      #API_JWT_JWKS: '{"keys":[]}'
+
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      METRICS_JWT_SECRET: ${JWT_SECRET}
+      ERL_AFLAGS: -proto_dist inet_tcp
+      DNS_NODES: "''"
+      RLIMIT_NOFILE: "10000"
+      APP_NAME: realtime
+      SEED_SELF_HOST: "true"
+      RUN_JANITOR: "true"
+      DISABLE_HEALTHCHECK_LOGGING: "true"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Storage
+  # To use S3 backed storage: see docker-compose.s3.yml
+  # ────────────────────────────────────────────────────────────────────────────
+  storage:
+    container_name: supabase-storage
+    image: supabase/storage-api:v1.44.11
+    restart: unless-stopped
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+      rest:
+        condition: service_started
+      imgproxy:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://storage:5000/status"
+        ]
+      timeout: 5s
+      interval: 5s
+      retries: 3
+      start_period: 10s
+    environment:
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      POSTGREST_URL: http://rest:3000
+
+      # Legacy symmetric HS256 key
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+
+      # JWKS for token verification (EC public + legacy symmetric)
+      # To enable, uncomment and set to valid JWKS JSON
+      #JWT_JWKS: '{"keys":[]}'
+
+      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@db:5432/postgres
+      STORAGE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}
+      REQUEST_ALLOW_X_FORWARDED_PATH: "true"
+      FILE_SIZE_LIMIT: 52428800
+      STORAGE_BACKEND: file
+      GLOBAL_S3_BUCKET: ${GLOBAL_S3_BUCKET:-stub}
+      # S3 Backend configuration
+      #GLOBAL_S3_ENDPOINT: https://your-s3-endpoint
+      #GLOBAL_S3_PROTOCOL: https
+      #GLOBAL_S3_FORCE_PATH_STYLE: true
+      #AWS_ACCESS_KEY_ID: your-access-key-id
+      #AWS_SECRET_ACCESS_KEY: your-secret-access-key
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      TENANT_ID: ${STORAGE_TENANT_ID:-stub}
+      REGION: ${REGION:-stub}
+      # S3 Vectors client always initializes at module load in storage-api >=1.44.
+      # VECTOR_BUCKET_REGION (primary) or REGION (fallback) must be a non-empty
+      # string to avoid "Region is missing" crash — even with STORAGE_BACKEND=file.
+      VECTOR_BUCKET_REGION: us-east-1
+      ENABLE_IMAGE_TRANSFORMATION: "true"
+      IMGPROXY_URL: http://imgproxy:5001
+      # S3 protocol endpoint configuration
+      S3_PROTOCOL_ACCESS_KEY_ID: ${S3_PROTOCOL_ACCESS_KEY_ID:-625729a08b95bf1b7ff351a663f3a23c}
+      S3_PROTOCOL_ACCESS_KEY_SECRET: ${S3_PROTOCOL_ACCESS_KEY_SECRET:-850181e4652dd023b7a98c58ae0d2d34bd487ee0cc3254aed6eda37307425907}
+    volumes:
+      - ./volumes/storage:/var/lib/storage:z
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # imgproxy
+  # ────────────────────────────────────────────────────────────────────────────
+  imgproxy:
+    container_name: supabase-imgproxy
+    image: darthsim/imgproxy:v3.30.1
+    restart: unless-stopped
+    volumes:
+      - ./volumes/storage:/var/lib/storage:z
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "imgproxy",
+          "health"
+        ]
+      timeout: 5s
+      interval: 5s
+      retries: 3
+    environment:
+      IMGPROXY_BIND: ":5001"
+      IMGPROXY_LOCAL_FILESYSTEM_ROOT: /
+      IMGPROXY_USE_ETAG: "true"
+      IMGPROXY_AUTO_WEBP: ${IMGPROXY_AUTO_WEBP:-true}
+      IMGPROXY_MAX_SRC_RESOLUTION: 16.8
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Meta — postgres-meta
+  # ────────────────────────────────────────────────────────────────────────────
+  meta:
+    container_name: supabase-meta
+    image: supabase/postgres-meta:v0.95.2
+    restart: unless-stopped
+    depends_on:
+      db:
+        # Disable this if you are using an external Postgres database
+        condition: service_healthy
+    environment:
+      PG_META_PORT: 8080
+      PG_META_DB_HOST: db
+      PG_META_DB_PORT: 5432
+      PG_META_DB_NAME: postgres
+      PG_META_DB_USER: supabase_admin
+      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      CRYPTO_KEY: ${PG_META_CRYPTO_KEY}
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Edge Functions init — ensures main entrypoint exists (Coolify bind-mount workaround)
+  # ────────────────────────────────────────────────────────────────────────────
+  functions-init:
+    image: superbase2/sb2-agent:local
+    pull_policy: build
+    build:
+      context: ./superbase2
+      dockerfile: agent/Dockerfile
+    restart: "no"
+    volumes:
+      - functions-data:/home/deno/functions
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        if [ ! -f /home/deno/functions/main/index.ts ]; then
+          mkdir -p /home/deno/functions/main
+          cp /opt/sb2-configs/functions/main/index.ts /home/deno/functions/main/index.ts
+          echo "[functions-init] Created default main/index.ts"
+        else
+          echo "[functions-init] main/index.ts already exists"
+        fi
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Edge Functions
+  # ────────────────────────────────────────────────────────────────────────────
+  functions:
+    container_name: supabase-edge-functions
+    image: supabase/edge-runtime:v1.71.2
+    restart: unless-stopped
+    volumes:
+      - functions-data:/home/deno/functions:Z
+      - deno-cache:/root/.cache/deno
+    depends_on:
+      functions-init:
+        condition: service_completed_successfully
+      kong:
+        condition: service_healthy
+    environment:
+      # Legacy symmetric HS256 key
+      JWT_SECRET: ${JWT_SECRET}
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      SUPABASE_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/postgres
+      VERIFY_JWT: ${FUNCTIONS_VERIFY_JWT:-true}
+    command:
+      [
+        "start",
+        "--main-service",
+        "/home/deno/functions/main"
+      ]
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Analytics — Logflare
+  # ────────────────────────────────────────────────────────────────────────────
+  analytics:
+    container_name: supabase-analytics
+    image: supabase/logflare:1.31.2
+    restart: unless-stopped
+    # ports:
+    #   - 4000:4000
+    # Uncomment to use Big Query backend for analytics
+    # volumes:
+    #   - type: bind
+    #     source: ./gcloud.json
+    #     target: /opt/app/rel/logflare/bin/gcloud.json
+    #     read_only: true
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-sSf",
+          "http://localhost:4000/health"
+        ]
+      timeout: 5s
+      interval: 10s
+      retries: 30
+      start_period: 120s
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+    environment:
+      LOGFLARE_NODE_HOST: 127.0.0.1
+      DB_USERNAME: supabase_admin
+      DB_DATABASE: _supabase
+      DB_HOSTNAME: db
+      DB_PORT: 5432
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_SCHEMA: _analytics
+      LOGFLARE_PUBLIC_ACCESS_TOKEN: ${LOGFLARE_PUBLIC_ACCESS_TOKEN}
+      LOGFLARE_PRIVATE_ACCESS_TOKEN: ${LOGFLARE_PRIVATE_ACCESS_TOKEN}
+      LOGFLARE_SINGLE_TENANT: true
+      LOGFLARE_SUPABASE_MODE: true
+
+      # Comment variables to use Big Query backend for analytics
+      POSTGRES_BACKEND_URL: postgresql://supabase_admin:${POSTGRES_PASSWORD}@db:5432/_supabase
+      POSTGRES_BACKEND_SCHEMA: _analytics
+      LOGFLARE_FEATURE_FLAG_OVERRIDE: multibackend=true
+      # Uncomment to use Big Query backend for analytics
+      # GOOGLE_PROJECT_ID: your-google-project-id
+      # GOOGLE_PROJECT_NUMBER: your-google-project-number
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Database — Postgres
+  # Comment out everything below this point if you are using an external Postgres database
+  # ────────────────────────────────────────────────────────────────────────────
+  # One-shot init container — copies baked DB init SQL from sb2-agent image
+  # into shared volumes. Configs live at /opt/sb2-configs/db-init/ in the image
+  # so the compose file stays small (Coolify ARG_MAX limit).
+  db-init:
+    image: superbase2/sb2-agent:local
+    pull_policy: build
+    build:
+      context: ./superbase2
+      dockerfile: agent/Dockerfile
+    restart: "no"
+    volumes:
+      - db-init-migrations:/init-scripts/migrations
+      - db-init-initscripts:/init-scripts/init-scripts
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        cp /opt/sb2-configs/db-init/migrations/* /init-scripts/migrations/
+        cp /opt/sb2-configs/db-init/init-scripts/* /init-scripts/init-scripts/
+        echo "[db-init] All SQL init scripts written"
+
+  # One-shot container that ensures the _supabase database and required schemas
+  # exist. Postgres docker-entrypoint-initdb.d scripts only run on first init
+  # (empty PGDATA), so on subsequent starts this container fills the gap.
+  db-setup:
+    image: supabase/postgres:17.6.1.084
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: supabase_admin
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: postgres
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        echo "[db-setup] Ensuring _supabase database exists..."
+        psql -tc "SELECT 1 FROM pg_database WHERE datname = '_supabase'" | grep -q 1 || \
+          psql -c "CREATE DATABASE _supabase WITH OWNER supabase_admin;"
+        echo "[db-setup] Ensuring schemas exist in _supabase..."
+        psql -d _supabase -c "CREATE SCHEMA IF NOT EXISTS _analytics; ALTER SCHEMA _analytics OWNER TO supabase_admin;"
+        psql -d _supabase -c "CREATE SCHEMA IF NOT EXISTS _supavisor; ALTER SCHEMA _supavisor OWNER TO supabase_admin;"
+        echo "[db-setup] Ensuring graphql_public schema exists..."
+        psql -c "CREATE SCHEMA IF NOT EXISTS graphql_public; ALTER SCHEMA graphql_public OWNER TO supabase_admin;"
+        psql -c "GRANT USAGE ON SCHEMA graphql_public TO postgres, anon, authenticated, service_role;"
+        echo "[db-setup] Ensuring realtime schemas exist..."
+        psql -c "CREATE SCHEMA IF NOT EXISTS _realtime; ALTER SCHEMA _realtime OWNER TO supabase_admin;"
+        psql -c "CREATE SCHEMA IF NOT EXISTS realtime; ALTER SCHEMA realtime OWNER TO supabase_admin;"
+        echo "[db-setup] Fixing auth schema ownership for GoTrue migrations..."
+        psql -c "ALTER SCHEMA auth OWNER TO supabase_auth_admin;" 2>/dev/null || true
+        psql -c "DO \$\$
+        DECLARE r RECORD;
+        BEGIN
+          FOR r IN SELECT p.proname, pg_get_function_identity_arguments(p.oid) as args
+            FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid
+            WHERE n.nspname = 'auth'
+          LOOP
+            EXECUTE format('ALTER FUNCTION auth.%I(%s) OWNER TO supabase_auth_admin', r.proname, r.args);
+          END LOOP;
+          FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'auth'
+          LOOP
+            EXECUTE format('ALTER TABLE auth.%I OWNER TO supabase_auth_admin', r.tablename);
+          END LOOP;
+          FOR r IN SELECT sequence_name FROM information_schema.sequences WHERE sequence_schema = 'auth'
+          LOOP
+            EXECUTE format('ALTER SEQUENCE auth.%I OWNER TO supabase_auth_admin', r.sequence_name);
+          END LOOP;
+        END \$\$;" 2>/dev/null || true
+        echo "[db-setup] Syncing service role passwords..."
+        if [ -z "$$PGPASSWORD" ]; then
+          echo "[db-setup] WARNING: POSTGRES_PASSWORD is empty — skipping password sync!"
+        else
+          psql -c "ALTER USER authenticator WITH PASSWORD '$$PGPASSWORD';"
+          psql -c "ALTER USER pgbouncer WITH PASSWORD '$$PGPASSWORD';"
+          psql -c "ALTER USER supabase_auth_admin WITH PASSWORD '$$PGPASSWORD';"
+          psql -tc "SELECT 1 FROM pg_roles WHERE rolname = 'supabase_functions_admin'" | grep -q 1 && \
+            psql -c "ALTER USER supabase_functions_admin WITH PASSWORD '$$PGPASSWORD';" || \
+            echo "[db-setup] role supabase_functions_admin does not exist, skipping"
+          psql -c "ALTER USER supabase_storage_admin WITH PASSWORD '$$PGPASSWORD';"
+        fi
+        echo "[db-setup] Done."
+
+  db:
+    container_name: supabase-db
+    image: supabase/postgres:17.6.1.084
+    restart: unless-stopped
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    volumes:
+      # Init SQL files from the db-init container (replaces file bind mounts
+      # which break on Coolify — Docker creates directories instead of files)
+      - db-init-migrations:/docker-entrypoint-initdb.d/migrations:z
+      - db-init-initscripts:/docker-entrypoint-initdb.d/init-scripts:z
+      # PGDATA directory is persisted between restarts
+      - ./volumes/db/data:/var/lib/postgresql/data:Z
+      # Use named volume to persist pgsodium decryption key between restarts
+      - db-config:/etc/postgresql-custom
+    healthcheck:
+      test:
+        [
+        "CMD",
+        "pg_isready",
+        "-U",
+        "postgres",
+        "-h",
+        "localhost"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    environment:
+      POSTGRES_HOST: /var/run/postgresql
+      PGPORT: 5432
+      POSTGRES_PORT: 5432
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXP: ${JWT_EXPIRY:-3600}
+    command:
+      [
+        "postgres",
+        "-c",
+        "config_file=/etc/postgresql/postgresql.conf",
+        "-c",
+        "log_min_messages=fatal" # prevents Realtime polling queries from appearing in logs
+      ]
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Vector / Pooler init — copies baked configs from sb2-agent image
+  # Configs live at /opt/sb2-configs/{vector,pooler}/ in the image so the
+  # compose file stays small (Coolify ARG_MAX limit).
+  # ────────────────────────────────────────────────────────────────────────────
+  vector-pooler-init:
+    image: superbase2/sb2-agent:local
+    pull_policy: build
+    build:
+      context: ./superbase2
+      dockerfile: agent/Dockerfile
+    restart: "no"
+    volumes:
+      - vector-config:/out/vector
+      - pooler-config:/out/pooler
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        echo "Writing vector.yml ..."
+        cp /opt/sb2-configs/vector/vector.yml /out/vector/vector.yml
+        echo "Writing pooler.exs ..."
+        cp /opt/sb2-configs/pooler/pooler.exs /out/pooler/pooler.exs
+        echo "Done."
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Vector — Log collector
+  # ────────────────────────────────────────────────────────────────────────────
+  vector:
+    container_name: supabase-vector
+    image: timberio/vector:0.53.0-alpine
+    restart: unless-stopped
+    depends_on:
+      vector-pooler-init:
+        condition: service_completed_successfully
+    volumes:
+      - vector-config:/etc/vector:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro,z
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://vector:9001/health"
+        ]
+      timeout: 5s
+      interval: 5s
+      retries: 3
+    environment:
+      LOGFLARE_PUBLIC_ACCESS_TOKEN: ${LOGFLARE_PUBLIC_ACCESS_TOKEN}
+    command:
+      [
+        "--config",
+        "/etc/vector/vector.yml"
+      ]
+    security_opt:
+      - "label=disable"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Supavisor — Connection pooler
+  # Update the DATABASE_URL if you are using an external Postgres database
+  # ────────────────────────────────────────────────────────────────────────────
+  supavisor:
+    container_name: supabase-pooler
+    image: supabase/supavisor:2.7.4
+    restart: unless-stopped
+    # No host ports — add via Coolify UI if direct DB access is needed
+    volumes:
+      - pooler-config:/etc/pooler:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-sSfL",
+          "--head",
+          "-o",
+          "/dev/null",
+          "http://127.0.0.1:4000/api/health"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+      vector-pooler-init:
+        condition: service_completed_successfully
+    environment:
+      PORT: 4000
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DATABASE_URL: ecto://supabase_admin:${POSTGRES_PASSWORD}@db:5432/_supabase
+      CLUSTER_POSTGRES: true
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      VAULT_ENC_KEY: ${VAULT_ENC_KEY}
+      API_JWT_SECRET: ${JWT_SECRET}
+      METRICS_JWT_SECRET: ${JWT_SECRET}
+      REGION: local
+      ERL_AFLAGS: -proto_dist inet_tcp
+      POOLER_TENANT_ID: ${POOLER_TENANT_ID:-default}
+      POOLER_DEFAULT_POOL_SIZE: ${POOLER_DEFAULT_POOL_SIZE:-20}
+      POOLER_MAX_CLIENT_CONN: ${POOLER_MAX_CLIENT_CONN:-100}
+      POOLER_POOL_MODE: transaction
+      DB_POOL_SIZE: ${POOLER_DB_POOL_SIZE:-5}
+    command:
+      [
+        "/bin/sh",
+        "-c",
+        "/app/bin/migrate && /app/bin/supavisor eval \"$$(cat /etc/pooler/pooler.exs)\" && /app/bin/server"
+      ]
+
+volumes:
+  db-config:
+  db-init-migrations:
+  db-init-initscripts:
+  kong-config:
+  vector-config:
+  pooler-config:
+  superbase2-config:
+  functions-data:
+  deno-cache:

@@ -178,16 +178,21 @@ type HandleErrorOptions = {
 }
 
 export const handleError = (error: unknown, options: HandleErrorOptions = {}): never => {
+  console.log('[SB2 debug] handleError raw', error)
   if (error && typeof error === 'object') {
     if (options.alwaysCapture) {
       Sentry.captureException(error, options.sentryContext)
     }
+    const nestedError =
+      'error' in error && error.error && typeof error.error === 'object' ? error.error : undefined
     const errorMessage =
       'msg' in error && typeof error.msg === 'string'
         ? error.msg
         : 'message' in error && typeof error.message === 'string'
           ? error.message
-          : undefined
+          : nestedError && 'message' in nestedError && typeof nestedError.message === 'string'
+            ? nestedError.message
+            : undefined
 
     const errorCode = 'code' in error && typeof error.code === 'number' ? error.code : undefined
     const requestId =
