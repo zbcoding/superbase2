@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
 import Head from 'next/head'
 import Link from 'next/link'
+import { useEffect, useMemo, useState } from 'react'
 
 /**
  * SuperBase² Dashboard — the main control panel.
@@ -22,6 +22,7 @@ interface CreatedProject extends Project {
   jwt_secret?: string
   anon_key?: string
   service_role_key?: string
+  db_url?: string
 }
 
 type LifecycleAction = 'up' | 'down' | 'restart'
@@ -39,6 +40,7 @@ interface ProjectKeys {
   anon_key: string
   service_role_key: string
   jwt_secret: string
+  db_url: string
   restart_pending?: boolean
 }
 
@@ -51,6 +53,7 @@ interface UpgradeInfo {
     updateAvailable: boolean
   }[]
   upgradeInstructions: string[] | null
+  upgradeNote: string | null
 }
 
 const PAGE_SIZE = 24
@@ -116,9 +119,10 @@ export default function SB2Dashboard() {
   const [revealedKeys, setRevealedKeys] = useState<Record<string, boolean>>({})
   const [rotateTarget, setRotateTarget] = useState<Project | null>(null)
   const [rotating, setRotating] = useState(false)
-  const [lifecycleConfirm, setLifecycleConfirm] = useState<
-    { project: Project; action: LifecycleAction } | null
-  >(null)
+  const [lifecycleConfirm, setLifecycleConfirm] = useState<{
+    project: Project
+    action: LifecycleAction
+  } | null>(null)
   const [hoveredCard, setHoveredCard] = useState<string | null>(null)
 
   useEffect(() => {
@@ -133,7 +137,9 @@ export default function SB2Dashboard() {
           return r.json()
         })
         .then((data) => setProjects(Array.isArray(data) ? data : []))
-        .catch((err) => { if (err.name !== 'AbortError') setError(err.message) }),
+        .catch((err) => {
+          if (err.name !== 'AbortError') setError(err.message)
+        }),
       fetch('/api/superbase2/upgrade', { signal })
         .then((r) => {
           if (!r.ok) return null
@@ -169,7 +175,9 @@ export default function SB2Dashboard() {
   )
 
   // Reset page when search changes
-  useEffect(() => { setPage(0) }, [search])
+  useEffect(() => {
+    setPage(0)
+  }, [search])
 
   /** POST with automatic CSRF retry: if the token hasn't been set yet
    *  (fresh page load), the first POST returns 403. We fetch projects (GET)
@@ -207,7 +215,9 @@ export default function SB2Dashboard() {
 
       if (!res.ok) {
         let message = 'Failed to create project'
-        try { message = (await res.json()).error?.message || message } catch {}
+        try {
+          message = (await res.json()).error?.message || message
+        } catch {}
         if (res.status === 403) message += ' — refresh the page and try again.'
         setError(message)
         return
@@ -269,7 +279,9 @@ export default function SB2Dashboard() {
       const res = await deleteWithCsrfRetry(`/api/superbase2/projects/${ref}`)
       if (!res.ok) {
         let message = 'Failed to delete project'
-        try { message = (await res.json()).error?.message || message } catch {}
+        try {
+          message = (await res.json()).error?.message || message
+        } catch {}
         if (res.status === 403) message += ' — refresh the page and try again.'
         setError(message)
         return
@@ -344,7 +356,11 @@ export default function SB2Dashboard() {
     }
   }
 
-  const handleToggleService = async (ref: string, serviceName: string, currentlyEnabled: boolean) => {
+  const handleToggleService = async (
+    ref: string,
+    serviceName: string,
+    currentlyEnabled: boolean
+  ) => {
     setTogglingService(ref)
     setServiceError(null)
     try {
@@ -379,7 +395,9 @@ export default function SB2Dashboard() {
         setServiceChanged(ref)
       } else {
         let message = 'Failed to toggle service'
-        try { message = (await res.json()).error?.message || message } catch {}
+        try {
+          message = (await res.json()).error?.message || message
+        } catch {}
         setServiceError(message)
       }
     } catch (err: unknown) {
@@ -406,7 +424,9 @@ export default function SB2Dashboard() {
         setKeys((prev) => ({ ...prev, [ref]: data }))
       } else {
         let message = 'Failed to load keys'
-        try { message = (await res.json()).error?.message || message } catch {}
+        try {
+          message = (await res.json()).error?.message || message
+        } catch {}
         setKeysError(message)
       }
     } catch (err: unknown) {
@@ -477,7 +497,9 @@ export default function SB2Dashboard() {
         <header style={styles.header} role="banner">
           <div style={styles.headerInner}>
             <div style={styles.logo}>
-              <span style={styles.logoIcon} aria-hidden="true">&#x26A1;&#xB2;</span>
+              <span style={styles.logoIcon} aria-hidden="true">
+                &#x26A1;&#xB2;
+              </span>
               <span style={styles.logoText}>SuperBase²</span>
             </div>
             <nav aria-label="SuperBase² navigation" style={styles.headerLinks}>
@@ -486,7 +508,10 @@ export default function SB2Dashboard() {
                   Studio →
                 </Link>
               ) : (
-                <span style={{ ...styles.headerLink, opacity: 0.4, cursor: 'default' }} title="Create a project first">
+                <span
+                  style={{ ...styles.headerLink, opacity: 0.4, cursor: 'default' }}
+                  title="Create a project first"
+                >
                   Studio →
                 </span>
               )}
@@ -499,7 +524,9 @@ export default function SB2Dashboard() {
           {upgrade?.hasUpdates && (
             <div style={styles.upgradeBanner} role="alert">
               <div style={styles.upgradeBannerInner}>
-                <span style={styles.upgradeIcon} aria-hidden="true">↑</span>
+                <span style={styles.upgradeIcon} aria-hidden="true">
+                  ↑
+                </span>
                 <div style={{ flex: 1 }}>
                   <strong>Updates available</strong>
                   <span style={styles.upgradeCount}>
@@ -516,11 +543,11 @@ export default function SB2Dashboard() {
                   </div>
                   {upgrade.upgradeInstructions && (
                     <div style={{ position: 'relative' as const }}>
-                      <pre style={styles.upgradeCode}>
-                        {upgrade.upgradeInstructions.join('\n')}
-                      </pre>
+                      <pre style={styles.upgradeCode}>{upgrade.upgradeInstructions.join('\n')}</pre>
                       <button
-                        onClick={() => handleCopy(upgrade.upgradeInstructions!.join('\n'), 'upgrade')}
+                        onClick={() =>
+                          handleCopy(upgrade.upgradeInstructions!.join('\n'), 'upgrade')
+                        }
                         style={styles.copyBtn}
                         aria-label="Copy upgrade commands"
                         title="Copy commands"
@@ -528,6 +555,11 @@ export default function SB2Dashboard() {
                         {copied === 'upgrade' ? 'Copied' : 'Copy'}
                       </button>
                     </div>
+                  )}
+                  {upgrade.upgradeNote && (
+                    <p style={{ fontSize: 12, color: SB2_MUTED, margin: '8px 0 0' }}>
+                      {upgrade.upgradeNote}
+                    </p>
                   )}
                 </div>
               </div>
@@ -537,7 +569,14 @@ export default function SB2Dashboard() {
           {/* Created project secrets (one-time display) */}
           {createdProject && (
             <div style={styles.secretsBanner} role="alert">
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  marginBottom: 12,
+                }}
+              >
                 <strong>Project '{createdProject.name}' created — save these secrets now!</strong>
                 <button
                   onClick={() => setCreatedProject(null)}
@@ -555,9 +594,26 @@ export default function SB2Dashboard() {
               {(() => {
                 const fields: { label: string; envKey: string; value?: string }[] = [
                   { label: 'Project Ref', envKey: 'PROJECT_REF', value: createdProject.ref },
-                  { label: 'JWT Secret', envKey: 'SUPABASE_JWT_SECRET', value: createdProject.jwt_secret },
-                  { label: 'Anon Key', envKey: 'SUPABASE_ANON_KEY', value: createdProject.anon_key },
-                  { label: 'Service Role Key', envKey: 'SUPABASE_SERVICE_ROLE_KEY', value: createdProject.service_role_key },
+                  {
+                    label: 'JWT Secret',
+                    envKey: 'SUPABASE_JWT_SECRET',
+                    value: createdProject.jwt_secret,
+                  },
+                  {
+                    label: 'Anon Key',
+                    envKey: 'SUPABASE_ANON_KEY',
+                    value: createdProject.anon_key,
+                  },
+                  {
+                    label: 'Service Role Key',
+                    envKey: 'SUPABASE_SERVICE_ROLE_KEY',
+                    value: createdProject.service_role_key,
+                  },
+                  {
+                    label: 'Database URL (in-network)',
+                    envKey: 'DATABASE_URL',
+                    value: createdProject.db_url,
+                  },
                 ]
                 const envBlock = fields
                   .filter((f) => f.value)
@@ -598,12 +654,16 @@ export default function SB2Dashboard() {
 
           {/* Projects list */}
           <section style={styles.section}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                marginBottom: 16,
+              }}
+            >
               <h2 style={{ ...styles.sectionTitle, marginBottom: 0 }}>
-                Projects{' '}
-                {!loading && (
-                  <span style={styles.count}>{filteredProjects.length}</span>
-                )}
+                Projects {!loading && <span style={styles.count}>{filteredProjects.length}</span>}
               </h2>
               {projects.length > 0 && (
                 <input
@@ -618,7 +678,9 @@ export default function SB2Dashboard() {
             </div>
 
             {loading ? (
-              <p style={styles.muted} role="status" aria-live="polite">Loading...</p>
+              <p style={styles.muted} role="status" aria-live="polite">
+                Loading...
+              </p>
             ) : filteredProjects.length === 0 ? (
               <p style={styles.muted}>
                 {search ? 'No projects match your search.' : 'No projects yet. Create one above.'}
@@ -630,237 +692,331 @@ export default function SB2Dashboard() {
                     const isActive = p.status === 'ACTIVE_HEALTHY'
                     const isHovered = hoveredCard === p.ref
                     return (
-                    <div
-                      key={p.ref}
-                      style={styles.card}
-                      role="listitem"
-                    >
-                      <Link
-                        href={`/project/${p.ref}`}
-                        onMouseEnter={() => setHoveredCard(p.ref)}
-                        onMouseLeave={() => setHoveredCard((prev) => (prev === p.ref ? null : prev))}
-                        style={{
-                          ...styles.cardOpenLink,
-                          borderColor: isHovered ? SB2_ACCENT_DARK : SB2_BORDER,
-                          backgroundColor: isHovered ? '#1f1a10' : SB2_BG,
-                        }}
-                        aria-label={`Open project ${p.name}`}
-                      >
-                        <div style={styles.cardHeader}>
-                          <span style={styles.cardName}>{p.name}</span>
-                          <span
+                      <div key={p.ref} style={styles.card} role="listitem">
+                        <Link
+                          href={`/project/${p.ref}`}
+                          onMouseEnter={() => setHoveredCard(p.ref)}
+                          onMouseLeave={() =>
+                            setHoveredCard((prev) => (prev === p.ref ? null : prev))
+                          }
+                          style={{
+                            ...styles.cardOpenLink,
+                            borderColor: isHovered ? SB2_ACCENT_DARK : SB2_BORDER,
+                            backgroundColor: isHovered ? '#1f1a10' : SB2_BG,
+                          }}
+                          aria-label={`Open project ${p.name}`}
+                        >
+                          <div style={styles.cardHeader}>
+                            <span style={styles.cardName}>{p.name}</span>
+                            <span
+                              style={{
+                                ...styles.statusBadge,
+                                ...(isActive ? styles.statusBadgeActive : null),
+                              }}
+                            >
+                              {isActive ? 'active' : p.status.toLowerCase().replace(/_/g, ' ')}
+                            </span>
+                          </div>
+                          <div style={styles.cardOpenHint}>
+                            <span>Open dashboard</span>
+                            <span aria-hidden style={{ marginLeft: 6 }}>
+                              →
+                            </span>
+                          </div>
+                        </Link>
+                        <div style={styles.cardMeta}>
+                          <button
+                            onClick={() => handleExpandServices(p.ref)}
                             style={{
-                              ...styles.statusBadge,
-                              ...(isActive ? styles.statusBadgeActive : null),
+                              ...styles.cardCopyBtn,
+                              ...(expandedRef === p.ref ? styles.cardCopyBtnActive : null),
                             }}
+                            aria-label={`Toggle services for ${p.name}`}
+                            aria-expanded={expandedRef === p.ref}
+                            title="Configure services"
                           >
-                            {isActive ? 'active' : p.status.toLowerCase().replace(/_/g, ' ')}
-                          </span>
+                            Services
+                          </button>
+                          <button
+                            onClick={() => handleExpandKeys(p.ref)}
+                            style={{
+                              ...styles.cardCopyBtn,
+                              ...(expandedKeysRef === p.ref ? styles.cardCopyBtnActive : null),
+                            }}
+                            aria-label={`Show API keys for ${p.name}`}
+                            aria-expanded={expandedKeysRef === p.ref}
+                            title="View ref + API keys + JWT secret"
+                          >
+                            Keys
+                          </button>
                         </div>
-                        <div style={styles.cardOpenHint}>
-                          <span>Open dashboard</span>
-                          <span aria-hidden style={{ marginLeft: 6 }}>→</span>
+                        <div style={styles.cardDivider} aria-hidden />
+                        <div style={styles.cardActions}>
+                          <button
+                            onClick={() => setLifecycleConfirm({ project: p, action: 'up' })}
+                            style={styles.startBtn}
+                            disabled={!!lifecycleBusy}
+                            title="Start container stack"
+                          >
+                            {lifecycleBusy === `up:${p.ref}` ? 'Starting…' : 'Start'}
+                          </button>
+                          <button
+                            onClick={() => setLifecycleConfirm({ project: p, action: 'down' })}
+                            style={styles.stopBtn}
+                            disabled={!!lifecycleBusy}
+                            title="Stop container stack"
+                          >
+                            {lifecycleBusy === `down:${p.ref}` ? 'Stopping…' : 'Stop'}
+                          </button>
+                          <button
+                            onClick={() => setLifecycleConfirm({ project: p, action: 'restart' })}
+                            style={styles.restartBtn}
+                            disabled={!!lifecycleBusy}
+                            title="Restart container stack"
+                          >
+                            {lifecycleBusy === `restart:${p.ref}` ? 'Restarting…' : 'Restart'}
+                          </button>
+                          <div style={{ flex: 1 }} />
+                          <button
+                            onClick={() => openDeleteModal(p)}
+                            style={styles.deleteBtn}
+                            disabled={deleting === p.ref}
+                            aria-label={`Delete project ${p.name}`}
+                          >
+                            {deleting === p.ref ? 'Deleting...' : 'Delete'}
+                          </button>
                         </div>
-                      </Link>
-                      <div style={styles.cardMeta}>
-                        <button
-                          onClick={() => handleExpandServices(p.ref)}
-                          style={{
-                            ...styles.cardCopyBtn,
-                            ...(expandedRef === p.ref ? styles.cardCopyBtnActive : null),
-                          }}
-                          aria-label={`Toggle services for ${p.name}`}
-                          aria-expanded={expandedRef === p.ref}
-                          title="Configure services"
-                        >
-                          Services
-                        </button>
-                        <button
-                          onClick={() => handleExpandKeys(p.ref)}
-                          style={{
-                            ...styles.cardCopyBtn,
-                            ...(expandedKeysRef === p.ref ? styles.cardCopyBtnActive : null),
-                          }}
-                          aria-label={`Show API keys for ${p.name}`}
-                          aria-expanded={expandedKeysRef === p.ref}
-                          title="View ref + API keys + JWT secret"
-                        >
-                          Keys
-                        </button>
-                      </div>
-                      <div style={styles.cardDivider} aria-hidden />
-                      <div style={styles.cardActions}>
-                        <button
-                          onClick={() => setLifecycleConfirm({ project: p, action: 'up' })}
-                          style={styles.startBtn}
-                          disabled={!!lifecycleBusy}
-                          title="Start container stack"
-                        >
-                          {lifecycleBusy === `up:${p.ref}` ? 'Starting…' : 'Start'}
-                        </button>
-                        <button
-                          onClick={() => setLifecycleConfirm({ project: p, action: 'down' })}
-                          style={styles.stopBtn}
-                          disabled={!!lifecycleBusy}
-                          title="Stop container stack"
-                        >
-                          {lifecycleBusy === `down:${p.ref}` ? 'Stopping…' : 'Stop'}
-                        </button>
-                        <button
-                          onClick={() => setLifecycleConfirm({ project: p, action: 'restart' })}
-                          style={styles.restartBtn}
-                          disabled={!!lifecycleBusy}
-                          title="Restart container stack"
-                        >
-                          {lifecycleBusy === `restart:${p.ref}` ? 'Restarting…' : 'Restart'}
-                        </button>
-                        <div style={{ flex: 1 }} />
-                        <button
-                          onClick={() => openDeleteModal(p)}
-                          style={styles.deleteBtn}
-                          disabled={deleting === p.ref}
-                          aria-label={`Delete project ${p.name}`}
-                        >
-                          {deleting === p.ref ? 'Deleting...' : 'Delete'}
-                        </button>
-                      </div>
-                      {/* Keys panel */}
-                      {expandedKeysRef === p.ref && (
-                        <div style={styles.servicesPanel}>
-                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-                            <div style={{ fontSize: 12, fontWeight: 600 }}>API keys & JWT secret</div>
-                            <div style={{ display: 'flex', gap: 6 }}>
+                        {/* Keys panel */}
+                        {expandedKeysRef === p.ref && (
+                          <div style={styles.servicesPanel}>
+                            <div
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'space-between',
+                                marginBottom: 6,
+                              }}
+                            >
+                              <div style={{ fontSize: 12, fontWeight: 600 }}>
+                                API keys & JWT secret
+                              </div>
+                              <div style={{ display: 'flex', gap: 6 }}>
+                                <button
+                                  onClick={() => toggleReveal(p.ref)}
+                                  style={styles.cardCopyBtn}
+                                  aria-label={revealedKeys[p.ref] ? 'Hide keys' : 'Reveal keys'}
+                                >
+                                  {revealedKeys[p.ref] ? 'Hide' : 'Reveal'}
+                                </button>
+                                <button
+                                  onClick={() => openRotateModal(p)}
+                                  style={{
+                                    ...styles.cardCopyBtn,
+                                    color: SB2_ACCENT,
+                                    borderColor: SB2_ACCENT_DARK,
+                                  }}
+                                  aria-label={`Rotate keys for ${p.name}`}
+                                  title="Generate new JWT secret + API keys (containers will restart)"
+                                >
+                                  Rotate
+                                </button>
+                              </div>
+                            </div>
+                            <div style={{ fontSize: 11, color: SB2_MUTED, marginBottom: 10 }}>
+                              These are the live keys from the project manifest. Treat the
+                              service_role key like a database password — never ship it to a
+                              browser.
+                            </div>
+                            {/* ponytail: static note, not a real credential row — sb2 has no
+                              per-project Postgres role yet, so there is nothing to fetch. */}
+                            <div style={{ fontSize: 11, color: SB2_MUTED, marginBottom: 10 }}>
+                              <strong>Postgres password:</strong> not rotated here and not
+                              per-project. Every project shares the one{' '}
+                              <code>POSTGRES_PASSWORD</code> from the server environment — only the
+                              database name differs. For an external client, create a scoped role in
+                              this project&apos;s database instead of handing out the superuser
+                              password.
+                            </div>
+                            <div style={{ fontSize: 11, color: SB2_MUTED, marginBottom: 10 }}>
+                              <strong>Database URL</strong> uses the <code>db</code> Docker
+                              hostname, so it works from edge functions and other containers on the
+                              Supabase network. Postgres is not published to the host by default —
+                              reaching it from outside Docker needs a published port or a pooler,
+                              and the hostname swapped for your server&apos;s address.
+                            </div>
+                            <div style={styles.secretRow}>
+                              <span style={styles.secretLabel}>Project ref</span>
+                              <code style={styles.secretValue}>{p.ref}</code>
                               <button
-                                onClick={() => toggleReveal(p.ref)}
-                                style={styles.cardCopyBtn}
-                                aria-label={revealedKeys[p.ref] ? 'Hide keys' : 'Reveal keys'}
+                                onClick={() => handleCopy(p.ref, `ref-${p.ref}`)}
+                                style={styles.copyBtn}
+                                aria-label={`Copy project ref ${p.ref}`}
+                                title="Copy ref"
                               >
-                                {revealedKeys[p.ref] ? 'Hide' : 'Reveal'}
-                              </button>
-                              <button
-                                onClick={() => openRotateModal(p)}
-                                style={{ ...styles.cardCopyBtn, color: SB2_ACCENT, borderColor: SB2_ACCENT_DARK }}
-                                aria-label={`Rotate keys for ${p.name}`}
-                                title="Generate new JWT secret + API keys (containers will restart)"
-                              >
-                                Rotate
+                                {copied === `ref-${p.ref}` ? 'Copied' : <ClipboardIcon />}
                               </button>
                             </div>
-                          </div>
-                          <div style={{ fontSize: 11, color: SB2_MUTED, marginBottom: 10 }}>
-                            These are the live keys from the project manifest. Treat the service_role key like a database password — never ship it to a browser.
-                          </div>
-                          <div style={styles.secretRow}>
-                            <span style={styles.secretLabel}>Project ref</span>
-                            <code style={styles.secretValue}>{p.ref}</code>
-                            <button
-                              onClick={() => handleCopy(p.ref, `ref-${p.ref}`)}
-                              style={styles.copyBtn}
-                              aria-label={`Copy project ref ${p.ref}`}
-                              title="Copy ref"
-                            >
-                              {copied === `ref-${p.ref}` ? 'Copied' : <ClipboardIcon />}
-                            </button>
-                          </div>
-                          {keysLoadingRef === p.ref && !keys[p.ref] ? (
-                            <span style={{ fontSize: 12, color: SB2_MUTED }}>Loading...</span>
-                          ) : keys[p.ref] ? (
-                            (() => {
-                              const k = keys[p.ref]
-                              const revealed = !!revealedKeys[p.ref]
-                              const mask = (s: string) => (revealed ? s : s ? '•'.repeat(Math.min(s.length, 32)) : '')
-                              const fields: { label: string; envKey: string; value: string | null }[] = [
-                                { label: 'URL', envKey: 'SUPABASE_URL', value: k.url },
-                                { label: 'Anon Key', envKey: 'SUPABASE_ANON_KEY', value: k.anon_key },
-                                { label: 'Service Role Key', envKey: 'SUPABASE_SERVICE_ROLE_KEY', value: k.service_role_key },
-                                { label: 'JWT Secret', envKey: 'SUPABASE_JWT_SECRET', value: k.jwt_secret },
-                              ]
-                              const envBlock = fields
-                                .filter((f) => f.value)
-                                .map((f) => `${f.envKey}=${f.value}`)
-                                .join('\n')
-                              return (
-                                <>
-                                  {fields.map(({ label, value }) =>
-                                    value ? (
-                                      <div key={label} style={styles.secretRow}>
-                                        <span style={styles.secretLabel}>{label}</span>
-                                        <code style={styles.secretValue}>
-                                          {label === 'URL' ? value : mask(value)}
-                                        </code>
-                                        <button
-                                          onClick={() => handleCopy(value, `${p.ref}-${label}`)}
-                                          style={styles.copyBtn}
-                                          aria-label={`Copy ${label}`}
-                                          title={`Copy ${label}`}
-                                        >
-                                          {copied === `${p.ref}-${label}` ? 'Copied' : <ClipboardIcon />}
-                                        </button>
-                                      </div>
-                                    ) : null
-                                  )}
-                                  <div style={{ marginTop: 8, display: 'flex', justifyContent: 'flex-end' }}>
-                                    <button
-                                      onClick={() => handleCopy(envBlock, `${p.ref}-all-env`)}
-                                      style={styles.copyBtn}
-                                      title="Copy as .env-style key=value block"
+                            {keysLoadingRef === p.ref && !keys[p.ref] ? (
+                              <span style={{ fontSize: 12, color: SB2_MUTED }}>Loading...</span>
+                            ) : keys[p.ref] ? (
+                              (() => {
+                                const k = keys[p.ref]
+                                const revealed = !!revealedKeys[p.ref]
+                                const mask = (s: string) =>
+                                  revealed ? s : s ? '•'.repeat(Math.min(s.length, 32)) : ''
+                                const fields: {
+                                  label: string
+                                  envKey: string
+                                  value: string | null
+                                }[] = [
+                                  { label: 'URL', envKey: 'SUPABASE_URL', value: k.url },
+                                  {
+                                    label: 'Anon Key',
+                                    envKey: 'SUPABASE_ANON_KEY',
+                                    value: k.anon_key,
+                                  },
+                                  {
+                                    label: 'Service Role Key',
+                                    envKey: 'SUPABASE_SERVICE_ROLE_KEY',
+                                    value: k.service_role_key,
+                                  },
+                                  {
+                                    label: 'JWT Secret',
+                                    envKey: 'SUPABASE_JWT_SECRET',
+                                    value: k.jwt_secret,
+                                  },
+                                  {
+                                    label: 'Database URL (in-network)',
+                                    envKey: 'DATABASE_URL',
+                                    value: k.db_url,
+                                  },
+                                ]
+                                // Neither of these carries a secret, so they render unmasked.
+                                const plain = new Set(['URL', 'Database URL (in-network)'])
+                                const envBlock = fields
+                                  .filter((f) => f.value)
+                                  .map((f) => `${f.envKey}=${f.value}`)
+                                  .join('\n')
+                                return (
+                                  <>
+                                    {fields.map(({ label, value }) =>
+                                      value ? (
+                                        <div key={label} style={styles.secretRow}>
+                                          <span style={styles.secretLabel}>{label}</span>
+                                          <code style={styles.secretValue}>
+                                            {plain.has(label) ? value : mask(value)}
+                                          </code>
+                                          <button
+                                            onClick={() => handleCopy(value, `${p.ref}-${label}`)}
+                                            style={styles.copyBtn}
+                                            aria-label={`Copy ${label}`}
+                                            title={`Copy ${label}`}
+                                          >
+                                            {copied === `${p.ref}-${label}` ? (
+                                              'Copied'
+                                            ) : (
+                                              <ClipboardIcon />
+                                            )}
+                                          </button>
+                                        </div>
+                                      ) : null
+                                    )}
+                                    <div
+                                      style={{
+                                        marginTop: 8,
+                                        display: 'flex',
+                                        justifyContent: 'flex-end',
+                                      }}
                                     >
-                                      {copied === `${p.ref}-all-env` ? 'Copied' : 'Copy as .env'}
-                                    </button>
-                                  </div>
-                                </>
-                              )
-                            })()
-                          ) : keysError && expandedKeysRef === p.ref ? (
-                            <p style={{ ...styles.error, marginTop: 0 }}>{keysError}</p>
-                          ) : null}
-                        </div>
-                      )}
-                      {/* Service toggles */}
-                      {expandedRef === p.ref && (
-                        <div style={styles.servicesPanel}>
-                          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>
-                            Per-project services
-                          </div>
-                          <div style={{ fontSize: 11, color: SB2_MUTED, marginBottom: 10 }}>
-                            Auth, PostgREST, and pg-meta are always on. Toggle optional services below.
-                          </div>
-                          {services[p.ref] ? (
-                            <>
-                              {services[p.ref].map((svc) => (
-                                <label key={svc.name} style={styles.serviceRow}>
-                                  <input
-                                    type="checkbox"
-                                    checked={svc.enabled}
-                                    onChange={() => handleToggleService(p.ref, svc.name, svc.enabled)}
-                                    disabled={togglingService === p.ref}
-                                    style={{ marginRight: 8, accentColor: SB2_ACCENT }}
-                                  />
-                                  <div style={{ flex: 1, minWidth: 0 }}>
-                                    <div style={{ fontSize: 13, fontWeight: 500 }}>
-                                      {svc.name.charAt(0).toUpperCase() + svc.name.slice(1)}
-                                      {!svc.enabled && <span style={{ color: '#ef4444', fontSize: 11, marginLeft: 6 }}>off</span>}
+                                      <button
+                                        onClick={() => handleCopy(envBlock, `${p.ref}-all-env`)}
+                                        style={styles.copyBtn}
+                                        title="Copy as .env-style key=value block"
+                                      >
+                                        {copied === `${p.ref}-all-env` ? 'Copied' : 'Copy as .env'}
+                                      </button>
                                     </div>
-                                    <div style={{ fontSize: 11, color: SB2_MUTED, lineHeight: '1.4' }}>{svc.description}</div>
+                                  </>
+                                )
+                              })()
+                            ) : keysError && expandedKeysRef === p.ref ? (
+                              <p style={{ ...styles.error, marginTop: 0 }}>{keysError}</p>
+                            ) : null}
+                          </div>
+                        )}
+                        {/* Service toggles */}
+                        {expandedRef === p.ref && (
+                          <div style={styles.servicesPanel}>
+                            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>
+                              Per-project services
+                            </div>
+                            <div style={{ fontSize: 11, color: SB2_MUTED, marginBottom: 10 }}>
+                              Auth, PostgREST, and pg-meta are always on. Toggle optional services
+                              below.
+                            </div>
+                            {services[p.ref] ? (
+                              <>
+                                {services[p.ref].map((svc) => (
+                                  <label key={svc.name} style={styles.serviceRow}>
+                                    <input
+                                      type="checkbox"
+                                      checked={svc.enabled}
+                                      onChange={() =>
+                                        handleToggleService(p.ref, svc.name, svc.enabled)
+                                      }
+                                      disabled={togglingService === p.ref}
+                                      style={{ marginRight: 8, accentColor: SB2_ACCENT }}
+                                    />
+                                    <div style={{ flex: 1, minWidth: 0 }}>
+                                      <div style={{ fontSize: 13, fontWeight: 500 }}>
+                                        {svc.name.charAt(0).toUpperCase() + svc.name.slice(1)}
+                                        {!svc.enabled && (
+                                          <span
+                                            style={{
+                                              color: '#ef4444',
+                                              fontSize: 11,
+                                              marginLeft: 6,
+                                            }}
+                                          >
+                                            off
+                                          </span>
+                                        )}
+                                      </div>
+                                      <div
+                                        style={{
+                                          fontSize: 11,
+                                          color: SB2_MUTED,
+                                          lineHeight: '1.4',
+                                        }}
+                                      >
+                                        {svc.description}
+                                      </div>
+                                    </div>
+                                  </label>
+                                ))}
+                                {serviceError && expandedRef === p.ref && (
+                                  <p
+                                    style={{ ...styles.error, marginTop: 8, marginBottom: 0 }}
+                                    role="alert"
+                                  >
+                                    {serviceError}
+                                  </p>
+                                )}
+                                {serviceChanged === p.ref && (
+                                  <div style={styles.restartNotice}>
+                                    Click <strong>Restart</strong> above to apply the service
+                                    changes.
                                   </div>
-                                </label>
-                              ))}
-                              {serviceError && expandedRef === p.ref && (
-                                <p style={{ ...styles.error, marginTop: 8, marginBottom: 0 }} role="alert">{serviceError}</p>
-                              )}
-                              {serviceChanged === p.ref && (
-                                <div style={styles.restartNotice}>
-                                  Click <strong>Restart</strong> above to apply the service changes.
-                                </div>
-                              )}
-                            </>
-                          ) : (
-                            <span style={{ fontSize: 12, color: SB2_MUTED }}>Loading...</span>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  )})}
+                                )}
+                              </>
+                            ) : (
+                              <span style={{ fontSize: 12, color: SB2_MUTED }}>Loading...</span>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
                 </div>
 
                 {/* Pagination */}
@@ -895,7 +1051,16 @@ export default function SB2Dashboard() {
           <section style={styles.section}>
             <h2 style={styles.sectionTitle}>Create Project</h2>
             <form onSubmit={handleCreate} style={styles.createForm} aria-label="Create new project">
-              <label htmlFor="sb2-project-name" style={{ position: 'absolute' as const, width: 1, height: 1, overflow: 'hidden', clip: 'rect(0,0,0,0)' }}>
+              <label
+                htmlFor="sb2-project-name"
+                style={{
+                  position: 'absolute' as const,
+                  width: 1,
+                  height: 1,
+                  overflow: 'hidden',
+                  clip: 'rect(0,0,0,0)',
+                }}
+              >
                 Project name
               </label>
               <input
@@ -912,11 +1077,19 @@ export default function SB2Dashboard() {
                 maxLength={48}
                 aria-describedby="sb2-project-hint"
               />
-              <button type="submit" style={styles.button} disabled={creating || !newName.trim() || newName.length < 2}>
+              <button
+                type="submit"
+                style={styles.button}
+                disabled={creating || !newName.trim() || newName.length < 2}
+              >
                 {creating ? 'Creating...' : 'Create'}
               </button>
             </form>
-            {error && <p style={styles.error} role="alert" aria-live="polite">{error}</p>}
+            {error && (
+              <p style={styles.error} role="alert" aria-live="polite">
+                {error}
+              </p>
+            )}
             <p id="sb2-project-hint" style={styles.hint}>
               Creates the database and secrets. Only letters and numbers allowed (no underscores or
               hyphens — required for Docker DNS). After creation, click{' '}
@@ -963,7 +1136,9 @@ export default function SB2Dashboard() {
           >
             <div style={styles.modal}>
               <div style={styles.modalHeader}>
-                <span style={styles.modalIcon} aria-hidden>⚠</span>
+                <span style={styles.modalIcon} aria-hidden>
+                  ⚠
+                </span>
                 <h3 id="sb2-delete-title" style={styles.modalTitle}>
                   Permanently delete this project?
                 </h3>
@@ -973,11 +1148,16 @@ export default function SB2Dashboard() {
                 <p style={{ margin: '0 0 12px 0', color: '#fecaca' }}>
                   This will <strong>drop the Postgres database</strong> for{' '}
                   <code style={styles.code}>{deleteTarget.name}</code> and remove it from the
-                  manifest. <strong>All tables, rows, storage objects, and auth users in this
-                  project will be destroyed.</strong>
+                  manifest.{' '}
+                  <strong>
+                    All tables, rows, storage objects, and auth users in this project will be
+                    destroyed.
+                  </strong>
                 </p>
                 <ul style={styles.modalList}>
-                  <li>This action is <strong>irreversible</strong> — there is no soft delete.</li>
+                  <li>
+                    This action is <strong>irreversible</strong> — there is no soft delete.
+                  </li>
                   <li>Per-project containers will be stopped automatically before the drop.</li>
                   <li>Other projects on this server are unaffected.</li>
                 </ul>
@@ -1034,62 +1214,63 @@ export default function SB2Dashboard() {
         )}
 
         {/* Lifecycle confirmation modal (start/stop/restart) */}
-        {lifecycleConfirm && (() => {
-          const { project: lp, action: la } = lifecycleConfirm
-          const verbTitle = la === 'up' ? 'Start' : la === 'down' ? 'Stop' : 'Restart'
-          const accent = la === 'down' ? '#ef4444' : SB2_ACCENT
-          const accentDark = la === 'down' ? '#7f1d1d' : SB2_ACCENT_DARK
-          const description =
-            la === 'up'
-              ? 'Boots the per-project containers (auth, rest, realtime, storage, functions, meta). Takes 30–90 seconds while each service passes its health check.'
-              : la === 'down'
-              ? 'Stops the per-project containers. The dashboard, database, and other projects keep running, but this project will stop responding to API requests until restarted.'
-              : 'Restarts the per-project containers. About 30–90 seconds of downtime for this project. Open Studio tabs may show errors during the restart — reload if they don\'t recover on their own.'
-          return (
-            <div
-              style={styles.modalBackdrop}
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="sb2-lifecycle-title"
-              onClick={(e) => {
-                if (e.target === e.currentTarget) setLifecycleConfirm(null)
-              }}
-            >
-              <div style={{ ...styles.modal, border: `2px solid ${accentDark}` }}>
-                <div style={styles.modalHeader}>
-                  <span style={{ ...styles.modalIcon, color: accent }} aria-hidden>
-                    {la === 'up' ? '▶' : la === 'down' ? '■' : '↻'}
-                  </span>
-                  <h3 id="sb2-lifecycle-title" style={{ ...styles.modalTitle, color: accent }}>
-                    {verbTitle} {lp.name}?
-                  </h3>
-                </div>
-                <div style={styles.modalBody}>
-                  <p style={{ margin: 0 }}>{description}</p>
-                </div>
-                <div style={styles.modalFooter}>
-                  <button onClick={() => setLifecycleConfirm(null)} style={styles.modalCancelBtn}>
-                    Cancel
-                  </button>
-                  <button
-                    onClick={() => {
-                      handleLifecycle(lp.ref, lp.name, la)
-                      setLifecycleConfirm(null)
-                    }}
-                    style={{
-                      ...styles.modalDeleteBtn,
-                      backgroundColor: accent,
-                      color: '#000',
-                      border: `1px solid ${accentDark}`,
-                    }}
-                  >
-                    {verbTitle} project
-                  </button>
+        {lifecycleConfirm &&
+          (() => {
+            const { project: lp, action: la } = lifecycleConfirm
+            const verbTitle = la === 'up' ? 'Start' : la === 'down' ? 'Stop' : 'Restart'
+            const accent = la === 'down' ? '#ef4444' : SB2_ACCENT
+            const accentDark = la === 'down' ? '#7f1d1d' : SB2_ACCENT_DARK
+            const description =
+              la === 'up'
+                ? 'Boots the per-project containers (auth, rest, realtime, storage, functions, meta). Takes 30–90 seconds while each service passes its health check.'
+                : la === 'down'
+                  ? 'Stops the per-project containers. The dashboard, database, and other projects keep running, but this project will stop responding to API requests until restarted.'
+                  : "Restarts the per-project containers. About 30–90 seconds of downtime for this project. Open Studio tabs may show errors during the restart — reload if they don't recover on their own."
+            return (
+              <div
+                style={styles.modalBackdrop}
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="sb2-lifecycle-title"
+                onClick={(e) => {
+                  if (e.target === e.currentTarget) setLifecycleConfirm(null)
+                }}
+              >
+                <div style={{ ...styles.modal, border: `2px solid ${accentDark}` }}>
+                  <div style={styles.modalHeader}>
+                    <span style={{ ...styles.modalIcon, color: accent }} aria-hidden>
+                      {la === 'up' ? '▶' : la === 'down' ? '■' : '↻'}
+                    </span>
+                    <h3 id="sb2-lifecycle-title" style={{ ...styles.modalTitle, color: accent }}>
+                      {verbTitle} {lp.name}?
+                    </h3>
+                  </div>
+                  <div style={styles.modalBody}>
+                    <p style={{ margin: 0 }}>{description}</p>
+                  </div>
+                  <div style={styles.modalFooter}>
+                    <button onClick={() => setLifecycleConfirm(null)} style={styles.modalCancelBtn}>
+                      Cancel
+                    </button>
+                    <button
+                      onClick={() => {
+                        handleLifecycle(lp.ref, lp.name, la)
+                        setLifecycleConfirm(null)
+                      }}
+                      style={{
+                        ...styles.modalDeleteBtn,
+                        backgroundColor: accent,
+                        color: '#000',
+                        border: `1px solid ${accentDark}`,
+                      }}
+                    >
+                      {verbTitle} project
+                    </button>
+                  </div>
                 </div>
               </div>
-            </div>
-          )
-        })()}
+            )
+          })()}
 
         {/* Rotate keys confirmation modal */}
         {rotateTarget && (
@@ -1104,27 +1285,48 @@ export default function SB2Dashboard() {
           >
             <div style={{ ...styles.modal, border: `2px solid ${SB2_ACCENT_DARK}` }}>
               <div style={styles.modalHeader}>
-                <span style={{ ...styles.modalIcon, color: SB2_ACCENT }} aria-hidden>↻</span>
+                <span style={{ ...styles.modalIcon, color: SB2_ACCENT }} aria-hidden>
+                  ↻
+                </span>
                 <h3 id="sb2-rotate-title" style={{ ...styles.modalTitle, color: SB2_ACCENT }}>
                   Rotate keys for {rotateTarget.name}?
                 </h3>
               </div>
               <div style={styles.modalBody}>
                 <p style={{ margin: '0 0 12px 0' }}>
-                  This will generate a new <strong>JWT secret</strong>, <strong>anon key</strong>, and{' '}
-                  <strong>service_role key</strong> for this project, then restart its containers.
+                  This will generate a new <strong>JWT secret</strong>, <strong>anon key</strong>,
+                  and <strong>service_role key</strong> for this project, then restart its
+                  containers.
                 </p>
                 <ul style={{ ...styles.modalList, color: SB2_TEXT }}>
-                  <li>All existing JWTs minted by this project become invalid immediately — users will be signed out.</li>
+                  <li>
+                    All existing JWTs minted by this project become invalid immediately — users will
+                    be signed out.
+                  </li>
                   <li>Every client SDK and server process using the old keys must be updated.</li>
-                  <li><strong>This project</strong> will experience 30–90s of downtime while its containers (auth, rest, realtime, storage, functions, meta) restart with the new keys.</li>
-                  <li><strong>This dashboard</strong> may show errors or appear frozen during the restart — open Studio tabs hold connections to the project's pg-meta and will reconnect once the containers are back. Reload the page if it doesn't recover.</li>
-                  <li>Other projects on this server are unaffected — Kong reloads its config without dropping connections.</li>
+                  <li>
+                    <strong>This project</strong> will experience 30–90s of downtime while its
+                    containers (auth, rest, realtime, storage, functions, meta) restart with the new
+                    keys.
+                  </li>
+                  <li>
+                    <strong>This dashboard</strong> may show errors or appear frozen during the
+                    restart — open Studio tabs hold connections to the project's pg-meta and will
+                    reconnect once the containers are back. Reload the page if it doesn't recover.
+                  </li>
+                  <li>
+                    Other projects on this server are unaffected — Kong reloads its config without
+                    dropping connections.
+                  </li>
                 </ul>
                 {keysError && <p style={{ ...styles.error, marginTop: 0 }}>{keysError}</p>}
               </div>
               <div style={styles.modalFooter}>
-                <button onClick={closeRotateModal} style={styles.modalCancelBtn} disabled={rotating}>
+                <button
+                  onClick={closeRotateModal}
+                  style={styles.modalCancelBtn}
+                  disabled={rotating}
+                >
                   Cancel
                 </button>
                 <button
@@ -1147,7 +1349,9 @@ export default function SB2Dashboard() {
         )}
 
         <footer style={styles.footer}>
-          <span style={styles.footerText}>SuperBase² — multi-project layer for self-hosted Supabase</span>
+          <span style={styles.footerText}>
+            SuperBase² — multi-project layer for self-hosted Supabase
+          </span>
         </footer>
       </div>
     </>

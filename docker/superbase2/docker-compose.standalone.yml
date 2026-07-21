@@ -196,6 +196,11 @@ services:
       SUPERBASE2_MANIFEST: /etc/superbase2/projects.json
       SUPERBASE2_COMPOSE_FILE: /etc/superbase2/docker-compose.yml
       SUPERBASE2_COMPOSE_CMD: "docker compose -f superbase2/docker-compose.standalone.yml"
+      # The upgrade banner prints SUPERBASE2_COMPOSE_CMD as shell commands unless
+      # COOLIFY_RESOURCE_UUID is set, in which case it says "redeploy in Coolify"
+      # instead. Coolify injects that variable itself; set it here only if you run
+      # a Coolify-style deploy where the compose file is regenerated for you.
+      # COOLIFY_RESOURCE_UUID: ""
       SB2_AGENT_URL: http://sb2-agent:8088
       SB2_AGENT_TOKEN: ${SB2_AGENT_TOKEN}
       NEXT_PUBLIC_GOTRUE_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}/auth/v1
