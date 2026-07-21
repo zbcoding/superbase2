@@ -140,6 +140,8 @@ Coolify expects a single compose file — it does not support the multi-file `-f
    |---|---|---|
    | `SUPERBASE2_ENABLED` | `true` | Multi-project mode. Set `false` for plain single-project Supabase. |
 
+   Do **not** add `COOLIFY_RESOURCE_UUID` here — Coolify injects it into every container it manages, and SuperBase² reads it to decide whether the upgrade banner shows shell commands or "redeploy in Coolify". If a future Coolify version stops setting it, the banner reverts to shell commands that won't survive your next redeploy; set it manually at that point.
+
 7. **Configure Domains in Coolify:** Coolify auto-generates a domain field for every service in the compose file. **Kong is the only service that gets a domain.** Everything else must be cleared.
    - `kong` → set your public domain, e.g. `https://supabase.yourdomain.com:8000`. Two requirements:
      - **`https://` prefix is required** — without it Coolify only generates HTTP routes and HTTPS will not work.
@@ -304,6 +306,10 @@ const supabase = createClient(
 ## Checking for updates
 
 The `/sb2` dashboard automatically checks Docker Hub for newer image tags. When updates are available, it shows an amber banner with the outdated services and upgrade commands.
+
+The banner shows shell commands built from `SUPERBASE2_COMPOSE_CMD`, **except on Coolify**, where it shows "Redeploy the application in Coolify" instead. Coolify regenerates the compose file on every deploy and keeps it outside the container, so a hand-run `docker compose up -d` is undone by the next redeploy.
+
+That branch is keyed on `COOLIFY_RESOURCE_UUID`, which Coolify injects into every container it manages (alongside `COOLIFY_CONTAINER_NAME`, `COOLIFY_FQDN`, `COOLIFY_URL`, `COOLIFY_BRANCH`). Nothing sets it in the standalone install. If Coolify ever renames that variable, the upgrade banner falls back to shell commands — wrong advice, but not a broken deployment. Set it manually to force the Coolify wording on a non-Coolify host.
 
 You can also check programmatically:
 

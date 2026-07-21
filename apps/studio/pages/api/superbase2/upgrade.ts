@@ -1,6 +1,7 @@
-import type { NextApiRequest, NextApiResponse } from 'next'
 import fs from 'fs'
 import path from 'path'
+import type { NextApiRequest, NextApiResponse } from 'next'
+
 import { requireAuth } from '@/lib/superbase2/auth'
 import { isSuperBase2Enabled } from '@/lib/superbase2/projects'
 
@@ -21,8 +22,7 @@ interface ImageStatus {
   error?: string
 }
 
-const COMPOSE_PATH =
-  process.env.SUPERBASE2_COMPOSE_FILE || '/etc/superbase2/docker-compose.yml'
+const COMPOSE_PATH = process.env.SUPERBASE2_COMPOSE_FILE || '/etc/superbase2/docker-compose.yml'
 
 // Services to skip when checking for updates (not real Supabase services)
 const SKIP_SERVICES = new Set(['superbase2-init'])
@@ -106,10 +106,13 @@ function parseComposeImages(composePath: string): Record<string, string> {
  */
 function compareSemver(a: string, b: string): number {
   const parse = (v: string) =>
-    v.replace(/^v/, '').split('.').map((p) => {
-      const n = parseInt(p, 10)
-      return isNaN(n) ? 0 : n
-    })
+    v
+      .replace(/^v/, '')
+      .split('.')
+      .map((p) => {
+        const n = parseInt(p, 10)
+        return isNaN(n) ? 0 : n
+      })
   const pa = parse(a)
   const pb = parse(b)
   for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
@@ -141,7 +144,8 @@ async function fetchLatestTag(image: string): Promise<string | null> {
     const data = await res.json()
     if (!data || !Array.isArray(data.results)) return null
     const tags: { name: string }[] = (data.results as unknown[]).filter(
-      (t): t is { name: string } => t !== null && typeof t === 'object' && typeof (t as any).name === 'string'
+      (t): t is { name: string } =>
+        t !== null && typeof t === 'object' && typeof (t as any).name === 'string'
     )
     if (tags.length === 0) return null
 
@@ -183,8 +187,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(500).json({ error: { message: 'Invalid compose file path' } })
   }
   const composePath = path.resolve(COMPOSE_PATH)
-  const composeCmd = process.env.SUPERBASE2_COMPOSE_CMD ||
+  const composeCmd =
+    process.env.SUPERBASE2_COMPOSE_CMD ||
     'docker compose -f docker-compose.yml -f docker-compose.superbase2.yml'
+
+  // Coolify generates the compose file on every deploy and stores it outside the
+  // container, so the git-pull + `docker compose up` steps are wrong there: the
+  // path in SUPERBASE2_COMPOSE_CMD isn't reachable, and a manual `up -d` would be
+  // undone by the next redeploy. Coolify always injects COOLIFY_RESOURCE_UUID.
+  const isCoolifyDeployment = Boolean(process.env.COOLIFY_RESOURCE_UUID)
 
   const currentImages = parseComposeImages(composePath)
 
@@ -204,9 +215,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       try {
         latest = await fetchLatestTag(currentImage)
       } catch (err: unknown) {
-        error = err instanceof Error && err.message === 'rate-limited'
-          ? 'Docker Hub rate limit reached — try again later'
-          : 'Failed to fetch latest tag'
+        error =
+          err instanceof Error && err.message === 'rate-limited'
+            ? 'Docker Hub rate limit reached — try again later'
+            : 'Failed to fetch latest tag'
       }
 
       const latestTag = latest?.split(':')[1] ?? null
@@ -220,7 +232,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         service,
         current: currentTag,
         latest: latestTag,
-        updateAvailable: currentTag !== null && latestTag !== null && latestCore !== currentCore && compareSemver(latestCore, currentCore) > 0,
+        updateAvailable:
+          currentTag !== null &&
+          latestTag !== null &&
+          latestCore !== currentCore &&
+          compareSemver(latestCore, currentCore) > 0,
         ...(error && { error }),
       }
     })
@@ -231,12 +247,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   return res.status(200).json({
     hasUpdates,
     services: results.sort((a, b) => a.service.localeCompare(b.service)),
-    upgradeInstructions: hasUpdates
-      ? [
-          'git pull upstream master',
-          `${composeCmd} pull`,
-          `${composeCmd} up -d`,
-        ]
-      : null,
+    upgradeInstructions:
+      hasUpdates && !isCoolifyDeployment
+        ? ['git pull upstream master', `${composeCmd} pull`, `${composeCmd} up -d`]
+        : null,
+    // Rendered as prose, not as a copyable command block — on Coolify the upgrade
+    // is a button in its UI, so there is nothing to paste into a shell.
+    upgradeNote:
+      hasUpdates && isCoolifyDeployment
+        ? 'Redeploy the application in Coolify to pull the new images.'
+        : null,
   })
 }
