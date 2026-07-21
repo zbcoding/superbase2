@@ -7,6 +7,7 @@
  */
 
 import type { NextApiRequest } from 'next'
+
 import type { MultiProject } from './projects'
 
 function getPublicUrl(): URL {
@@ -18,14 +19,20 @@ function getDbVersion(): string {
 }
 
 /** Clamp pagination params to safe ranges. */
-export function clampPagination(req: NextApiRequest, defaults: { limit: number; offset: number } = { limit: 100, offset: 0 }) {
+export function clampPagination(
+  req: NextApiRequest,
+  defaults: { limit: number; offset: number } = { limit: 100, offset: 0 }
+) {
   // Next.js can parse repeated query params as string[], pick the first element.
   const limitStr = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit
   const offsetStr = Array.isArray(req.query.offset) ? req.query.offset[0] : req.query.offset
   // Use ?? instead of || so that an explicit limit=0 is clamped to 1 rather than
   // falling back to the default (parseInt("0") is 0, which is falsy with ||).
   const parsedLimit = parseInt(limitStr ?? String(defaults.limit), 10)
-  const limit = Math.min(Math.max(Number.isFinite(parsedLimit) ? parsedLimit : defaults.limit, 1), 500)
+  const limit = Math.min(
+    Math.max(Number.isFinite(parsedLimit) ? parsedLimit : defaults.limit, 1),
+    500
+  )
   const offset = Math.max(parseInt(offsetStr || String(defaults.offset), 10) || 0, 0)
   return { limit, offset }
 }
@@ -145,6 +152,24 @@ export function toSettingsResponse(p: MultiProject) {
   }
 }
 
+/**
+ * Direct Postgres connection string, with the password left as a placeholder:
+ * sb2 has no per-project role, so every project authenticates with the shared
+ * POSTGRES_PASSWORD from the server's .env, which is never sent to the browser.
+ * Only the database name differs per project.
+ *
+ * POSTGRES_HOST is the Docker service name (`db`), so this address resolves only
+ * from containers on the Supabase network — edge functions, or an app deployed
+ * alongside the stack. The db service publishes no host port by default, so a
+ * client outside Docker cannot use this string as-is; it needs a published port
+ * or a pooler in front, and then the host swapped for the server's address.
+ */
+export function toDbUrlTemplate(p: MultiProject) {
+  const host = process.env.POSTGRES_HOST || 'db'
+  const port = process.env.POSTGRES_PORT || '5432'
+  return `postgresql://postgres:[POSTGRES_PASSWORD]@${host}:${port}/${p.db}`
+}
+
 /** Full project detail including secrets — only returned on project creation.
  *  The UI shows these once and instructs the user to save them. */
 export function toCreationResponse(p: MultiProject) {
@@ -153,6 +178,7 @@ export function toCreationResponse(p: MultiProject) {
     jwt_secret: p.jwt_secret,
     anon_key: p.anon_key,
     service_role_key: p.service_role_key,
+    db_url: toDbUrlTemplate(p),
   }
 }
 
@@ -163,9 +189,10 @@ export function toPostgrestConfigResponse(p: MultiProject) {
     db_extra_search_path: process.env.PGRST_DB_EXTRA_SEARCH_PATH ?? 'public',
     db_schema: process.env.PGRST_DB_SCHEMAS ?? 'public,storage,graphql_public',
     jwt_secret: p.jwt_secret,
-    max_rows: process.env.PGRST_DB_MAX_ROWS !== undefined
-      ? (parseInt(process.env.PGRST_DB_MAX_ROWS, 10) || 1000)
-      : 1000,
+    max_rows:
+      process.env.PGRST_DB_MAX_ROWS !== undefined
+        ? parseInt(process.env.PGRST_DB_MAX_ROWS, 10) || 1000
+        : 1000,
     role_claim_key: '.role',
   }
 }
@@ -173,7 +200,12 @@ export function toPostgrestConfigResponse(p: MultiProject) {
 /** Shape expected by useOrgProjectsInfiniteQuery / GET /platform/organizations/{slug}/projects */
 export function toOrgProjectsResponse(
   projects: MultiProject[],
-  { limit = 96, offset = 0, search, sort }: {
+  {
+    limit = 96,
+    offset = 0,
+    search,
+    sort,
+  }: {
     limit?: number
     offset?: number
     search?: string

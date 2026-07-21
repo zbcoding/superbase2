@@ -999,6 +999,8 @@ cmd_client_config() {
     echo ""
     echo "Direct database connection:"
     echo "  postgresql://postgres:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT}/${PROJECT_DB}"
+    echo "  (requires the db port to be published on the host — 'docker port <db-container>'"
+    echo "   prints nothing under Coolify. From another container use host 'db' instead.)"
     echo ""
 }
 

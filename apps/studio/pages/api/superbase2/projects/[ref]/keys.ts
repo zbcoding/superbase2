@@ -1,12 +1,9 @@
 import type { NextApiRequest, NextApiResponse } from 'next'
 
-import { requireAuth, checkCsrf } from '@/lib/superbase2/auth'
-import {
-  AgentUnavailableError,
-  callAgent,
-  isAgentConfigured,
-} from '@/lib/superbase2/agent-client'
+import { AgentUnavailableError, callAgent, isAgentConfigured } from '@/lib/superbase2/agent-client'
+import { checkCsrf, requireAuth } from '@/lib/superbase2/auth'
 import { getProject, isSuperBase2Enabled, isValidProjectRef } from '@/lib/superbase2/projects'
+import { toDbUrlTemplate } from '@/lib/superbase2/response-helpers'
 
 /**
  * GET  /api/superbase2/projects/{ref}/keys           — return current keys
@@ -85,10 +82,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       // the rotation itself already succeeded; the worst case is the user
       // restarts the project manually.
       callAgent('restart', project.name).catch((err) => {
-        console.error(
-          `[SuperBase²] post-rotation restart failed for '${project.name}':`,
-          err
-        )
+        console.error(`[SuperBase²] post-rotation restart failed for '${project.name}':`, err)
       })
 
       return res.status(200).json({
@@ -117,5 +111,6 @@ function buildKeysPayload(project: ReturnType<typeof getProject> & object) {
     anon_key: project.anon_key,
     service_role_key: project.service_role_key,
     jwt_secret: project.jwt_secret,
+    db_url: toDbUrlTemplate(project),
   }
 }
