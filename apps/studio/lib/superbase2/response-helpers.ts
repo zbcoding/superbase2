@@ -193,6 +193,10 @@ export function toCreationResponse(p: MultiProject) {
     anon_key: p.anon_key,
     service_role_key: p.service_role_key,
     db_url: toDbUrlTemplate(p),
+    // Also surfaced on its own, not just embedded in db_url — clients that
+    // configure host/user/password separately can't parse it back out.
+    // Null on projects that predate per-project roles.
+    db_password: p.db_password ?? null,
   }
 }
 

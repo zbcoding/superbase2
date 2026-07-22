@@ -23,6 +23,7 @@ interface CreatedProject extends Project {
   anon_key?: string
   service_role_key?: string
   db_url?: string
+  db_password?: string | null
 }
 
 type LifecycleAction = 'up' | 'down' | 'restart'
@@ -41,6 +42,7 @@ interface ProjectKeys {
   service_role_key: string
   jwt_secret: string
   db_url: string
+  db_password: string | null
   restart_pending?: boolean
 }
 
@@ -610,6 +612,11 @@ export default function SB2Dashboard() {
                     value: createdProject.service_role_key,
                   },
                   {
+                    label: 'Database Password',
+                    envKey: 'POSTGRES_PASSWORD',
+                    value: createdProject.db_password ?? undefined,
+                  },
+                  {
                     label: 'Database URL (in-network)',
                     envKey: 'DATABASE_URL',
                     value: createdProject.db_url,
@@ -880,6 +887,11 @@ export default function SB2Dashboard() {
                                     label: 'JWT Secret',
                                     envKey: 'SUPABASE_JWT_SECRET',
                                     value: k.jwt_secret,
+                                  },
+                                  {
+                                    label: 'Database Password',
+                                    envKey: 'POSTGRES_PASSWORD',
+                                    value: k.db_password,
                                   },
                                   {
                                     label: 'Database URL (in-network)',
