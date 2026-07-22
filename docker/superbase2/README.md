@@ -284,7 +284,8 @@ The standard Supabase Studio sidebar and `Cmd+K` project switcher work automatic
 ./superbase2.sh status                  # show container status (warns on JWT-secret drift)
 ./superbase2.sh verify                  # check that container JWT secrets match the manifest
 ./superbase2.sh client-config myproject # print SDK connection details
-./superbase2.sh rotate-keys myproject   # mint a fresh JWT secret + ANON/SERVICE keys, reload Kong
+./superbase2.sh rotate-keys myproject   # mint a fresh JWT secret + ANON/SERVICE keys + DB password, reload Kong
+./superbase2.sh migrate-db-owner myproject # one-time: give a pre-existing project its own DB role
 ./superbase2.sh rebuild-kong            # regenerate per-project Kong routes (zero-downtime reload)
 ./superbase2.sh down myproject          # stop a project's containers
 ./superbase2.sh destroy myproject       # delete project, database, and all data
@@ -300,6 +301,68 @@ const supabase = createClient(
   '<anon-key>'  // from: ./superbase2.sh client-config <name>
 )
 ```
+
+### Per-project database credentials
+
+Each project gets its **own Postgres login role**, named after its database
+(`project_<name>`), with its own generated password. That role owns the
+database, so the connection string SB2 hands out can create tables, add indexes
+and alter its own schema:
+
+```
+postgresql://project_myapp:<password>@db:5432/project_myapp
+```
+
+Get it from `./superbase2.sh client-config <name>`, or from the keys panel on
+the `/sb2` dashboard (masked — click **Reveal**).
+
+**Why it matters.** Earlier versions handed out the cluster-wide
+`POSTGRES_PASSWORD` as every project's database password. That leaked one
+credential across all projects, and because the `postgres` role did not own the
+project databases, the connection string could not run DDL at all — `CREATE
+TABLE` and `CREATE INDEX` failed. Both problems are fixed by the per-project
+role.
+
+The role is deliberately confined:
+
+- it can only connect to **its own** database (`CONNECT` is revoked from
+  `PUBLIC`), so one project's credential cannot open another's;
+- it has no `CREATEROLE`, `CREATEDB`, `REPLICATION` and no `pg_read_all_data`,
+  since roles and databases are cluster-global;
+- it can read its own `auth` and `storage` schemas, so the SQL editor and table
+  editor work normally.
+
+`POSTGRES_PASSWORD` still exists for server-side services and still connects,
+but it is no longer a project credential: as the `postgres` role it can read and
+write rows, and **cannot** run DDL against a project's tables. Move anything
+that applies migrations or a `schema.sql` onto the per-project URL.
+
+### Rotating credentials
+
+```bash
+./superbase2.sh rotate-keys myproject
+```
+
+Regenerates the JWT secret, anon key, service_role key **and** the database
+password in one step, updates the manifest and the project `.env`, reloads Kong
+and restarts the project's containers. The database is untouched — no migration,
+no data movement. The **Rotate** button in the `/sb2` keys panel does exactly
+this and handles the restart for you.
+
+Projects created before per-project roles existed keep the shared server
+password until they are migrated:
+
+```bash
+./superbase2.sh migrate-db-owner myproject
+./superbase2.sh down myproject && ./superbase2.sh up myproject
+```
+
+This creates the role and transfers the database, the `public` schema and every
+object in it to that role. Data is untouched. Reassignment is restricted to
+`public` on purpose — a database-wide `REASSIGN OWNED` would move `auth`,
+`storage` and `realtime` objects too and break GoTrue, Storage and Realtime.
+`rotate-keys` skips the password roll for un-migrated projects rather than mint
+a credential that authenticates but owns nothing.
 
 ---
 
@@ -347,6 +410,8 @@ The existing Studio UI components — project switcher, command palette, project
 - **Realtime / Storage / Edge Functions / Analytics are not exercised yet.** Containers boot and Kong routes resolve, but real subscriptions, file uploads, function invocations, and log queries haven't been smoke-tested end-to-end. Expect rough edges and please open issues.
 - **Kong API keys are per-project.** Each project gets its own consumers and API key credentials in Kong, generated during `rebuild-kong`. Projects are isolated at both the Kong routing layer (API key validation) and the JWT level (per-service JWT secrets).
 - **Untested at scale.** This has been tested with a handful of projects. Running 50+ projects on one instance is uncharted territory.
+- **Project roles can still reach the main `postgres` database.** `PUBLIC` holds `CONNECT` there, so a project role can open it, though it can read nothing inside. Revoking that would mean auditing every main-stack service.
+- **Database passwords are generated, not chosen.** `rotate-keys` mints a new random password; there is no way to set a specific one.
 
 ---
 
