@@ -112,5 +112,8 @@ function buildKeysPayload(project: ReturnType<typeof getProject> & object) {
     service_role_key: project.service_role_key,
     jwt_secret: project.jwt_secret,
     db_url: toDbUrlTemplate(project),
+    // Rotated by `rotate-keys` alongside the JWT secret, so it has to come
+    // back in this payload too. Null on projects without a per-project role.
+    db_password: project.db_password ?? null,
   }
 }
