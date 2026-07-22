@@ -827,15 +827,11 @@ export default function SB2Dashboard() {
                               service_role key like a database password — never ship it to a
                               browser.
                             </div>
-                            {/* ponytail: static note, not a real credential row — sb2 has no
-                              per-project Postgres role yet, so there is nothing to fetch. */}
                             <div style={{ fontSize: 11, color: SB2_MUTED, marginBottom: 10 }}>
-                              <strong>Postgres password:</strong> not rotated here and not
-                              per-project. Every project shares the one{' '}
-                              <code>POSTGRES_PASSWORD</code> from the server environment — only the
-                              database name differs. For an external client, create a scoped role in
-                              this project&apos;s database instead of handing out the superuser
-                              password.
+                              <strong>Database password:</strong> the Database URL below
+                              authenticates as this project&apos;s own Postgres role, which owns
+                              this database and cannot open any other project&apos;s. Rotate
+                              regenerates it along with the keys.
                             </div>
                             <div style={{ fontSize: 11, color: SB2_MUTED, marginBottom: 10 }}>
                               <strong>Database URL</strong> uses the <code>db</code> Docker
@@ -891,8 +887,9 @@ export default function SB2Dashboard() {
                                     value: k.db_url,
                                   },
                                 ]
-                                // Neither of these carries a secret, so they render unmasked.
-                                const plain = new Set(['URL', 'Database URL (in-network)'])
+                                // Only the project URL is safe to show unmasked — the
+                                // database URL now embeds the project's real password.
+                                const plain = new Set(['URL'])
                                 const envBlock = fields
                                   .filter((f) => f.value)
                                   .map((f) => `${f.envKey}=${f.value}`)
@@ -1294,14 +1291,24 @@ export default function SB2Dashboard() {
               </div>
               <div style={styles.modalBody}>
                 <p style={{ margin: '0 0 12px 0' }}>
-                  This will generate a new <strong>JWT secret</strong>, <strong>anon key</strong>,
-                  and <strong>service_role key</strong> for this project, then restart its
-                  containers.
+                  This will generate a new <strong>JWT secret</strong>, <strong>anon key</strong>,{' '}
+                  <strong>service_role key</strong> and <strong>database password</strong> for this
+                  project, then restart its containers.
                 </p>
                 <ul style={{ ...styles.modalList, color: SB2_TEXT }}>
                   <li>
                     All existing JWTs minted by this project become invalid immediately — users will
                     be signed out.
+                  </li>
+                  <li>
+                    The database password is regenerated, so anything connecting over this
+                    project&apos;s <code>DATABASE_URL</code> must be updated too. The database
+                    itself is untouched — no data moves.
+                  </li>
+                  <li>
+                    Projects created before per-project database roles existed keep the shared
+                    server password; only their keys rotate. Run{' '}
+                    <code>superbase2.sh migrate-db-owner &lt;name&gt;</code> to give one its own.
                   </li>
                   <li>Every client SDK and server process using the old keys must be updated.</li>
                   <li>
