@@ -170,8 +170,12 @@ services:
       PG_META_DB_HOST: ${POSTGRES_HOST}
       PG_META_DB_PORT: ${POSTGRES_PORT}
       PG_META_DB_NAME: "{{PROJECT_DB}}"
-      PG_META_DB_USER: supabase_admin
-      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      # The project role, not supabase_admin: tables the table editor creates are
+      # owned by whoever pg-meta connects as, and they must be owned by the same
+      # role the DATABASE_URL authenticates as or the user cannot ALTER them.
+      # Matches upstream docker-compose.yml, which points pg-meta at `postgres`.
+      PG_META_DB_USER: "{{PROJECT_DB}}"
+      PG_META_DB_PASSWORD: ${PROJECT_DB_PASSWORD}
       CRYPTO_KEY: ${PROJECT_PG_META_CRYPTO_KEY}
 
   functions-init-{{PROJECT_NAME}}:
@@ -209,7 +213,7 @@ services:
       SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL}
       SUPABASE_ANON_KEY: ${PROJECT_ANON_KEY}
       SUPABASE_SERVICE_ROLE_KEY: ${PROJECT_SERVICE_ROLE_KEY}
-      SUPABASE_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/{{PROJECT_DB}}
+      SUPABASE_DB_URL: postgresql://{{PROJECT_DB}}:${PROJECT_DB_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/{{PROJECT_DB}}
       VERIFY_JWT: "${FUNCTIONS_VERIFY_JWT}"
     command:
       [

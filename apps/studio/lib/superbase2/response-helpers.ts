@@ -67,7 +67,7 @@ export function toProjectDetail(p: MultiProject) {
     db_host: process.env.POSTGRES_HOST || 'db',
     db_name: p.db,
     db_port: parseInt(process.env.POSTGRES_PORT || '5432', 10),
-    db_user: 'postgres',
+    db_user: toDbUser(p),
     dbVersion: getDbVersion(),
     is_branch_enabled: false,
     is_physical_backups_enabled: false,
@@ -95,7 +95,7 @@ export function toDatabasesResponse(p: MultiProject) {
       db_host: process.env.POSTGRES_HOST || 'db',
       db_name: p.db,
       db_port: parseInt(process.env.POSTGRES_PORT || '5432', 10),
-      db_user: 'postgres',
+      db_user: toDbUser(p),
       identifier: p.ref,
       inserted_at: p.created_at || '',
       region: 'local',
@@ -129,7 +129,7 @@ export function toSettingsResponse(p: MultiProject) {
     db_ip_addr_config: 'legacy' as const,
     db_name: p.db,
     db_port: parseInt(process.env.POSTGRES_PORT || '5432', 10),
-    db_user: 'postgres',
+    db_user: toDbUser(p),
     inserted_at: p.created_at || '',
     jwt_secret: p.jwt_secret,
     name: p.name,
@@ -153,10 +153,16 @@ export function toSettingsResponse(p: MultiProject) {
 }
 
 /**
- * Direct Postgres connection string, with the password left as a placeholder:
- * sb2 has no per-project role, so every project authenticates with the shared
- * POSTGRES_PASSWORD from the server's .env, which is never sent to the browser.
- * Only the database name differs per project.
+ * Direct Postgres connection string for the project.
+ *
+ * Authenticates as the project's own login role (named after the database),
+ * which owns the database — so this credential can CREATE in `public` and
+ * ALTER/DROP the project's own tables, and cannot open any other project's
+ * database. Rotating it is `superbase2.sh rotate-keys`.
+ *
+ * Projects created before per-project roles existed have no `db_password` and
+ * fall back to the old shared-superuser placeholder until
+ * `superbase2.sh migrate-db-owner <name>` has been run for them.
  *
  * POSTGRES_HOST is the Docker service name (`db`), so this address resolves only
  * from containers on the Supabase network — edge functions, or an app deployed
@@ -167,7 +173,15 @@ export function toSettingsResponse(p: MultiProject) {
 export function toDbUrlTemplate(p: MultiProject) {
   const host = process.env.POSTGRES_HOST || 'db'
   const port = process.env.POSTGRES_PORT || '5432'
-  return `postgresql://postgres:[POSTGRES_PASSWORD]@${host}:${port}/${p.db}`
+  if (!p.db_password) {
+    return `postgresql://postgres:[POSTGRES_PASSWORD]@${host}:${port}/${p.db}`
+  }
+  return `postgresql://${p.db}:${p.db_password}@${host}:${port}/${p.db}`
+}
+
+/** The role a client authenticates as over toDbUrlTemplate(). */
+export function toDbUser(p: MultiProject) {
+  return p.db_password ? p.db : 'postgres'
 }
 
 /** Full project detail including secrets — only returned on project creation.

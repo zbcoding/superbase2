@@ -14,8 +14,7 @@ import path from 'path'
 
 import { isValidProjectName } from './db'
 
-const MANIFEST_PATH =
-  process.env.SUPERBASE2_MANIFEST || '/etc/superbase2/projects.json'
+const MANIFEST_PATH = process.env.SUPERBASE2_MANIFEST || '/etc/superbase2/projects.json'
 
 const LOCK_PATH = MANIFEST_PATH + '.lock'
 const LOCK_STALE_MS = 10_000 // Consider lock stale after 10 seconds
@@ -25,7 +24,7 @@ const LOCK_STALE_MS = 10_000 // Consider lock stale after 10 seconds
  *  meta is required for the Studio table editor.
  *  realtime, storage, and functions can be toggled off. */
 export const OPTIONAL_SERVICES = ['realtime', 'storage', 'functions'] as const
-export type OptionalService = typeof OPTIONAL_SERVICES[number]
+export type OptionalService = (typeof OPTIONAL_SERVICES)[number]
 
 export interface MultiProject {
   ref: string
@@ -39,6 +38,11 @@ export interface MultiProject {
   // Services that are explicitly disabled for this project.
   // If undefined or empty, all services are enabled (default).
   disabled_services?: OptionalService[]
+  // Password for this project's own Postgres login role (named after `db`).
+  // This is the credential surfaced as DATABASE_URL. Absent on projects created
+  // before per-project roles existed — those still fall back to the shared
+  // POSTGRES_PASSWORD placeholder until `superbase2.sh migrate-db-owner` runs.
+  db_password?: string
   // Secondary secrets — stored in manifest so disk-state reconstruction
   // doesn't regenerate them (which would break running services).
   // Optional for backward compatibility with older manifests.
@@ -61,7 +65,10 @@ interface Manifest {
  */
 function tryAcquireLock(retries: number = 1): boolean {
   try {
-    const fd = fs.openSync(LOCK_PATH, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY)
+    const fd = fs.openSync(
+      LOCK_PATH,
+      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY
+    )
     fs.writeSync(fd, `${process.pid}:${Date.now()}`)
     fs.closeSync(fd)
     return true
@@ -131,7 +138,9 @@ function readManifest(): Manifest {
     const raw = fs.readFileSync(MANIFEST_PATH, 'utf-8')
     const parsed = JSON.parse(raw)
     if (!parsed || !Array.isArray(parsed.projects)) {
-      console.error(`[SuperBase²] Manifest at ${MANIFEST_PATH} has invalid structure, treating as empty`)
+      console.error(
+        `[SuperBase²] Manifest at ${MANIFEST_PATH} has invalid structure, treating as empty`
+      )
       return { projects: [] }
     }
     return parsed
@@ -164,7 +173,9 @@ function writeManifest(manifest: Manifest): void {
  * Perform a locked read-modify-write on the manifest.
  * Ensures concurrent API requests don't lose writes.
  */
-async function withManifestLock<T>(fn: (manifest: Manifest) => { manifest: Manifest; result: T }): Promise<T> {
+async function withManifestLock<T>(
+  fn: (manifest: Manifest) => { manifest: Manifest; result: T }
+): Promise<T> {
   await acquireLock()
   try {
     const current = readManifest()
@@ -224,7 +235,10 @@ export async function updateProjectName(ref: string, newName: string): Promise<b
   })
 }
 
-export async function updateDisabledServices(ref: string, disabled: OptionalService[]): Promise<boolean> {
+export async function updateDisabledServices(
+  ref: string,
+  disabled: OptionalService[]
+): Promise<boolean> {
   return withManifestLock((manifest) => {
     const project = manifest.projects.find((p) => p.ref === ref)
     if (!project) return { manifest, result: false }
@@ -283,6 +297,8 @@ export function generateProjectSecrets(name: string) {
     service_role_key: serviceRoleKey,
     status: 'ACTIVE_HEALTHY',
     created_at: new Date().toISOString(),
+    // Hex so it needs no escaping in a connection string or in DDL.
+    db_password: crypto.randomBytes(24).toString('hex'),
     // Secondary secrets — persisted in manifest so they survive disk-state reconstruction
     secret_key_base: crypto.randomBytes(48).toString('base64'),
     // 8 raw bytes → 16 hex chars = 16 ASCII bytes, the size AES-128-ECB requires.

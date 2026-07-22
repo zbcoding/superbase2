@@ -227,7 +227,7 @@ sync_manifest() {
     for d in "$PROJECTS_DIR"/*/; do
         [ -d "$d" ] || continue
         local name ref db jwt_secret anon_key service_role_key created_at
-        local secret_key_base pg_meta_crypto_key s3_access_key_id s3_access_key_secret
+        local secret_key_base pg_meta_crypto_key s3_access_key_id s3_access_key_secret db_password
         name=$(basename "$d")
         [ -f "$d/.env" ] || continue
         disk_projects["$name"]=1
@@ -244,6 +244,10 @@ sync_manifest() {
         pg_meta_crypto_key=$(grep "^PROJECT_PG_META_CRYPTO_KEY=" "$d/.env" | cut -d= -f2-)
         s3_access_key_id=$(grep "^PROJECT_S3_ACCESS_KEY_ID=" "$d/.env" | cut -d= -f2-)
         s3_access_key_secret=$(grep "^PROJECT_S3_ACCESS_KEY_SECRET=" "$d/.env" | cut -d= -f2-)
+        # `|| true` because unlike the keys above this one is absent on projects
+        # that predate per-project roles, and `set -o pipefail` would abort the
+        # whole sync on the failed grep.
+        db_password=$(grep "^PROJECT_DB_PASSWORD=" "$d/.env" | cut -d= -f2- || true)
 
         disk_json=$(echo "$disk_json" | jq \
             --arg ref "$ref" \
@@ -258,7 +262,8 @@ sync_manifest() {
             --arg pmck "$pg_meta_crypto_key" \
             --arg s3id "$s3_access_key_id" \
             --arg s3sec "$s3_access_key_secret" \
-            '. + [{ref: $ref, name: $name, db: $db, jwt_secret: $jwt, anon_key: $anon, service_role_key: $srk, status: "ACTIVE_HEALTHY", created_at: $ca, secret_key_base: $skb, db_enc_key: $dek, pg_meta_crypto_key: $pmck, s3_access_key_id: $s3id, s3_access_key_secret: $s3sec}]')
+            --arg dbpw "$db_password" \
+            '. + [{ref: $ref, name: $name, db: $db, jwt_secret: $jwt, anon_key: $anon, service_role_key: $srk, status: "ACTIVE_HEALTHY", created_at: $ca, secret_key_base: $skb, db_enc_key: $dek, pg_meta_crypto_key: $pmck, s3_access_key_id: $s3id, s3_access_key_secret: $s3sec, db_password: $dbpw}]')
     done
 
     # Collect disk project names into a jq-friendly array
@@ -272,9 +277,17 @@ sync_manifest() {
     manifest_only=$(echo "$existing_json" | jq --argjson names "$disk_names_json" \
         '[.projects[] | select(.name as $n | $names | index($n) | not)]')
 
+    # disabled_services is written by the Studio API into the manifest only —
+    # it has no .env counterpart, so rebuilding a disk entry from .env drops it
+    # and silently re-enables services the user turned off. Carry it across.
+    local disabled_map
+    disabled_map=$(echo "$existing_json" | jq \
+        '[.projects[] | select(.disabled_services != null) | {key: .name, value: .disabled_services}] | from_entries')
+
     # Merge: disk projects first, then manifest-only entries
-    jq -n --argjson disk "$disk_json" --argjson manifest "$manifest_only" \
-        '{projects: ($disk + $manifest)}' > "$PROJECTS_MANIFEST"
+    jq -n --argjson disk "$disk_json" --argjson manifest "$manifest_only" --argjson disabled "$disabled_map" \
+        '{projects: (($disk | map(if $disabled[.name] then . + {disabled_services: $disabled[.name]} else . end)) + $manifest)}' \
+        > "$PROJECTS_MANIFEST"
 }
 
 project_exists() {
@@ -350,6 +363,9 @@ cmd_create() {
     local s3_access_key_secret
     s3_access_key_secret=$(gen_hex 32)
     local db_name="project_${name}"
+    local db_password
+    # Hex so it needs no escaping in a connection string or in DDL.
+    db_password=$(gen_hex 24)
 
     # Write project .env
     cat > "$project_dir/.env" <<EOF
@@ -371,6 +387,7 @@ PROJECT_DB_ENC_KEY=$db_enc_key
 PROJECT_PG_META_CRYPTO_KEY=$pg_meta_crypto_key
 PROJECT_S3_ACCESS_KEY_ID=$s3_access_key_id
 PROJECT_S3_ACCESS_KEY_SECRET=$s3_access_key_secret
+PROJECT_DB_PASSWORD=$db_password
 
 # Shared infra (from main .env)
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
@@ -430,7 +447,7 @@ EOF
 
     # Create the database and initialize schemas
     echo "Creating database: $db_name"
-    _init_project_db "$name" "$db_name" "$jwt_secret" "${JWT_EXPIRY:-3600}"
+    _init_project_db "$name" "$db_name" "$jwt_secret" "${JWT_EXPIRY:-3600}" "$db_password"
 
     # Sync manifest for Studio and rebuild Kong
     sync_manifest
@@ -450,18 +467,62 @@ EOF
     echo "Client config:  ./superbase2.sh client-config $name"
 }
 
+# Create or repair the project's own Postgres login role.
+#
+# The role is named after the database and owns it, so the DATABASE_URL we hand
+# out authenticates as a role that can CREATE in public and ALTER/DROP its own
+# tables. Idempotent — this is also the password-rotation path.
+#
+# Deliberately NOT a member of anon/authenticated/service_role: those hold
+# CONNECT on every project database, so membership would let one project's
+# credential open every other project's database.
+#
+# Keep in sync with createProjectRole() in apps/studio/lib/superbase2/db.ts.
+_ensure_project_db_role() {
+    local role="$1"
+    local password="$2"
+
+    if ! [[ "$password" =~ ^[a-f0-9]{32,128}$ ]]; then
+        echo "Error: database password must be 32-128 lowercase hex characters."
+        exit 1
+    fi
+
+    # supabase_admin, not postgres: creating a role with BYPASSRLS and granting
+    # pg_read_all_data both require superuser.
+    docker exec -i "$(db_container)" psql -U supabase_admin -d postgres <<EOSQL
+DO \$\$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$role') THEN
+    EXECUTE format('ALTER ROLE %I WITH LOGIN INHERIT BYPASSRLS PASSWORD %L', '$role', '$password');
+  ELSE
+    EXECUTE format('CREATE ROLE %I LOGIN INHERIT BYPASSRLS PASSWORD %L', '$role', '$password');
+  END IF;
+END
+\$\$;
+-- No CREATEROLE / CREATEDB / REPLICATION, and no pg_read_all_data: upstream's
+-- \`postgres\` role has them, but roles and databases are cluster-global and a
+-- project must not reach outside its own database. Read access to the
+-- service-managed schemas is granted per-database instead.
+ALTER ROLE "$role" SET search_path TO "\$user", public, extensions;
+EOSQL
+}
+
 _init_project_db() {
     local name="$1"
     local db_name="$2"
     local jwt_secret="$3"
     local jwt_exp="$4"
+    local db_password="$5"
+
+    _ensure_project_db_role "$db_name" "$db_password"
 
     # Create the database — check for "already exists" explicitly
     local db_ctr
     db_ctr=$(db_container)
-    if ! docker exec "$db_ctr" psql -U postgres -c "CREATE DATABASE \"$db_name\";" 2>&1; then
-        if docker exec "$db_ctr" psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name';" | grep -q 1; then
-            echo "Database '$db_name' already exists — continuing."
+    if ! docker exec "$db_ctr" psql -U supabase_admin -c "CREATE DATABASE \"$db_name\" OWNER \"$db_name\";" 2>&1; then
+        if docker exec "$db_ctr" psql -U supabase_admin -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name';" | grep -q 1; then
+            echo "Database '$db_name' already exists — taking ownership."
+            docker exec "$db_ctr" psql -U supabase_admin -c "ALTER DATABASE \"$db_name\" OWNER TO \"$db_name\";"
         else
             echo "Error: Failed to create database '$db_name'."
             exit 1
@@ -482,7 +543,7 @@ _init_project_db() {
     # Uses an unquoted heredoc so $db_name, $safe_jwt_secret, and $jwt_exp
     # are expanded by the shell. The only literal $ needed is in \$user
     # (the Postgres search_path variable), which is escaped with backslash.
-    docker exec "$db_ctr" psql -U postgres -d "$db_name" <<EOSQL
+    docker exec -i "$db_ctr" psql -U supabase_admin -d "$db_name" <<EOSQL
 -- Set JWT config
 ALTER DATABASE "$db_name" SET "app.settings.jwt_secret" TO '$safe_jwt_secret';
 ALTER DATABASE "$db_name" SET "app.settings.jwt_exp" TO '$jwt_exp';
@@ -507,16 +568,45 @@ ALTER ROLE supabase_auth_admin SET search_path TO 'auth', 'public', 'extensions'
 CREATE SCHEMA IF NOT EXISTS graphql_public;
 GRANT USAGE ON SCHEMA graphql_public TO anon, authenticated, service_role;
 
+-- public is owned by pg_database_owner, which resolves to the project role now
+-- that it owns the database. Reassert it: a database created by an earlier sb2
+-- version can have public owned by supabase_admin directly, and then database
+-- ownership alone does not grant CREATE.
+ALTER SCHEMA public OWNER TO pg_database_owner;
+
 -- Grant schema usage
 GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated, service_role;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO anon, authenticated, service_role;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated, service_role;
 
+-- The grants above only cover objects created by supabase_admin (the role
+-- running this). Tables the user creates over DATABASE_URL, or that pg-meta
+-- creates for the table editor, are owned by the project role — without these,
+-- PostgREST cannot see any of them.
+ALTER DEFAULT PRIVILEGES FOR ROLE "$db_name" IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES FOR ROLE "$db_name" IN SCHEMA public GRANT ALL ON FUNCTIONS TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES FOR ROLE "$db_name" IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated, service_role;
+
+-- Read access to the service-managed schemas, so the SQL editor and pg-meta
+-- (both connect as the project role) can browse auth.users and storage.objects.
+-- Scoped to this database rather than granted via pg_read_all_data, which would
+-- also expose the main postgres database. The tables do not exist yet — GoTrue
+-- and Storage create them on first run — so the default-privilege grants are
+-- what actually apply.
+GRANT USAGE ON SCHEMA auth, storage TO "$db_name";
+ALTER DEFAULT PRIVILEGES FOR ROLE supabase_auth_admin IN SCHEMA auth GRANT SELECT ON TABLES TO "$db_name";
+ALTER DEFAULT PRIVILEGES FOR ROLE supabase_storage_admin IN SCHEMA storage GRANT SELECT ON TABLES TO "$db_name";
+
+-- Confine this project's credential to this project's database. PUBLIC holds
+-- CONNECT by default, which would make the per-project password meaningless.
+REVOKE CONNECT ON DATABASE "$db_name" FROM PUBLIC;
+
 -- Service roles need CONNECT privilege on non-default databases.
 -- Without this, PostgREST (authenticator) and Storage (supabase_storage_admin) fail to connect.
 GRANT ALL ON DATABASE "$db_name" TO supabase_storage_admin;
 GRANT ALL ON DATABASE "$db_name" TO supabase_auth_admin;
+GRANT ALL ON DATABASE "$db_name" TO postgres;
 GRANT CONNECT ON DATABASE "$db_name" TO authenticator;
 GRANT CONNECT ON DATABASE "$db_name" TO anon;
 GRANT CONNECT ON DATABASE "$db_name" TO authenticated;
@@ -533,8 +623,13 @@ CREATE EXTENSION IF NOT EXISTS pg_stat_statements WITH SCHEMA extensions;
 -- uuid_generate_v4() work without schema-qualifying them.
 ALTER DATABASE "$db_name" SET search_path TO "\$user", public, extensions;
 
--- Grant usage so all roles can access extension functions
+-- Grant usage so all roles can access extension functions. The project role is
+-- not a member of anon/authenticated/service_role, so it needs its own grant —
+-- without it uuid_generate_v4() and friends are unresolvable over DATABASE_URL
+-- even though they are on the search_path.
 GRANT USAGE ON SCHEMA extensions TO anon, authenticated, service_role;
+GRANT USAGE ON SCHEMA extensions TO "$db_name";
+GRANT USAGE ON SCHEMA graphql_public TO "$db_name";
 EOSQL
 
     echo "Database '$db_name' initialized."
@@ -575,10 +670,15 @@ cmd_destroy() {
         echo "Warning: Some containers may not have stopped cleanly."
     fi
 
-    # Drop the database
+    # Drop the database, then the project's login role. supabase_admin, not
+    # postgres: postgres does not own the database and cannot drop it.
     echo "Dropping database: $PROJECT_DB"
-    if ! docker exec "$(db_container)" psql -U postgres -c "DROP DATABASE IF EXISTS \"$PROJECT_DB\";" 2>&1; then
+    if ! docker exec "$(db_container)" psql -U supabase_admin -c "DROP DATABASE IF EXISTS \"$PROJECT_DB\";" 2>&1; then
         echo "Warning: Failed to drop database '$PROJECT_DB'. It may need manual cleanup."
+    fi
+    # Roles are cluster-global, so the login role outlives the database.
+    if ! docker exec "$(db_container)" psql -U supabase_admin -c "DROP ROLE IF EXISTS \"$PROJECT_DB\";" 2>&1; then
+        echo "Warning: Failed to drop role '$PROJECT_DB'. It may need manual cleanup."
     fi
 
     # Remove project directory
@@ -817,6 +917,17 @@ _generate_disk_state_from_manifest() {
     [ -z "$s3_access_key_id" ] && s3_access_key_id=$(gen_hex 16)
     [ -z "$s3_access_key_secret" ] && s3_access_key_secret=$(gen_hex 32)
 
+    # The project's Postgres login role password. Unlike the secrets above, this
+    # one also lives in the cluster — if the manifest has none (project predates
+    # per-project roles, or was created by an older Studio), generate one and
+    # apply it, otherwise the .env we write would not authenticate.
+    local db_password
+    db_password=$(echo "$manifest_json" | jq -r '.db_password // empty')
+    if [ -z "$db_password" ]; then
+        db_password=$(gen_hex 24)
+        _ensure_project_db_role "$db" "$db_password"
+    fi
+
     # Write .env
     cat > "$project_dir/.env" <<EOF
 # Project: $name
@@ -837,6 +948,7 @@ PROJECT_DB_ENC_KEY=$db_enc_key
 PROJECT_PG_META_CRYPTO_KEY=$pg_meta_crypto_key
 PROJECT_S3_ACCESS_KEY_ID=$s3_access_key_id
 PROJECT_S3_ACCESS_KEY_SECRET=$s3_access_key_secret
+PROJECT_DB_PASSWORD=$db_password
 
 # Shared infra (from main .env)
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
@@ -998,7 +1110,13 @@ cmd_client_config() {
     echo "  SUPABASE_JWT_SECRET=${PROJECT_JWT_SECRET}"
     echo ""
     echo "Direct database connection:"
-    echo "  postgresql://postgres:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT}/${PROJECT_DB}"
+    if [ -n "${PROJECT_DB_PASSWORD:-}" ]; then
+        echo "  postgresql://${PROJECT_DB}:${PROJECT_DB_PASSWORD}@localhost:${POSTGRES_PORT}/${PROJECT_DB}"
+    else
+        echo "  postgresql://postgres:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT}/${PROJECT_DB}"
+        echo "  (shared cluster password — run './superbase2.sh migrate-db-owner ${PROJECT_NAME}'"
+        echo "   to give this project its own role and password.)"
+    fi
     echo "  (requires the db port to be published on the host — 'docker port <db-container>'"
     echo "   prints nothing under Coolify. From another container use host 'db' instead.)"
     echo ""
@@ -1014,6 +1132,132 @@ cmd_setup() {
     echo ""
     echo "Project '$name' is fully running!"
     echo "  Client config:  ./superbase2.sh client-config $name"
+}
+
+# Backfill a project created before per-project roles existed.
+#
+# Such projects have a database owned by supabase_admin (UI path) or postgres
+# (CLI path) and tables in public owned by whoever pg-meta connected as, so the
+# DATABASE_URL sb2 hands out cannot CREATE in public or ALTER its own tables.
+# This gives the project its own role, transfers ownership to it, and writes the
+# new password into .env + manifest. Data is untouched.
+cmd_migrate_db_owner() {
+    local name="$1"
+
+    if ! project_exists "$name"; then
+        echo "Error: Project '$name' does not exist."
+        exit 1
+    fi
+
+    local env_file="$PROJECTS_DIR/$name/.env"
+    local db
+    db=$(grep "^PROJECT_DB=" "$env_file" | cut -d= -f2-)
+    if [ -z "$db" ]; then
+        echo "Error: PROJECT_DB missing from project .env."
+        exit 1
+    fi
+
+    local db_password
+    db_password=$(gen_hex 24)
+
+    echo "Migrating '$name' ($db) to a per-project database role..."
+    _ensure_project_db_role "$db" "$db_password"
+
+    local db_ctr
+    db_ctr=$(db_container)
+    docker exec "$db_ctr" psql -U supabase_admin -v ON_ERROR_STOP=1 \
+        -c "ALTER DATABASE \"$db\" OWNER TO \"$db\";"
+
+    docker exec -i "$db_ctr" psql -U supabase_admin -v ON_ERROR_STOP=1 -d "$db" <<EOSQL
+-- project_vrsite's case: public owned by supabase_admin directly, so database
+-- ownership alone would not restore CREATE.
+ALTER SCHEMA public OWNER TO pg_database_owner;
+
+-- Reassign only public. REASSIGN OWNED BY is database-wide and would move
+-- auth/storage/realtime objects too, breaking GoTrue, Storage and Realtime.
+DO \$\$
+DECLARE r record;
+BEGIN
+  FOR r IN
+    SELECT c.relname, c.relkind
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public'
+       AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+       AND pg_get_userbyid(c.relowner) <> '$db'
+       -- SERIAL/IDENTITY sequences cannot be reowned on their own ("is linked
+       -- to table"); they follow their table's owner automatically.
+       AND NOT (c.relkind = 'S' AND EXISTS (
+             SELECT 1 FROM pg_depend d
+              WHERE d.classid = 'pg_class'::regclass
+                AND d.objid = c.oid
+                AND d.deptype = 'a'))
+     -- Tables before views: a view cannot be reowned to a role that lacks
+     -- privileges on the tables it reads.
+     ORDER BY CASE c.relkind WHEN 'r' THEN 0 WHEN 'p' THEN 0 ELSE 1 END
+  LOOP
+    EXECUTE format(
+      CASE r.relkind
+        WHEN 'S' THEN 'ALTER SEQUENCE public.%I OWNER TO %I'
+        WHEN 'v' THEN 'ALTER VIEW public.%I OWNER TO %I'
+        WHEN 'm' THEN 'ALTER MATERIALIZED VIEW public.%I OWNER TO %I'
+        WHEN 'f' THEN 'ALTER FOREIGN TABLE public.%I OWNER TO %I'
+        ELSE 'ALTER TABLE public.%I OWNER TO %I'
+      END, r.relname, '$db');
+  END LOOP;
+
+  FOR r IN
+    SELECT p.oid::regprocedure AS sig
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'public'
+       AND pg_get_userbyid(p.proowner) <> '$db'
+  LOOP
+    EXECUTE format('ALTER ROUTINE %s OWNER TO %I', r.sig, '$db');
+  END LOOP;
+END
+\$\$;
+
+ALTER DEFAULT PRIVILEGES FOR ROLE "$db" IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES FOR ROLE "$db" IN SCHEMA public GRANT ALL ON FUNCTIONS TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES FOR ROLE "$db" IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated, service_role;
+
+-- Read access to the service-managed schemas for the SQL editor and pg-meta.
+-- Unlike a fresh database these tables already exist, so grant on both the
+-- existing ones and (via default privileges) any created later.
+GRANT USAGE ON SCHEMA extensions TO "$db";
+GRANT USAGE ON SCHEMA auth, storage TO "$db";
+GRANT SELECT ON ALL TABLES IN SCHEMA auth TO "$db";
+GRANT SELECT ON ALL TABLES IN SCHEMA storage TO "$db";
+ALTER DEFAULT PRIVILEGES FOR ROLE supabase_auth_admin IN SCHEMA auth GRANT SELECT ON TABLES TO "$db";
+ALTER DEFAULT PRIVILEGES FOR ROLE supabase_storage_admin IN SCHEMA storage GRANT SELECT ON TABLES TO "$db";
+
+REVOKE CONNECT ON DATABASE "$db" FROM PUBLIC;
+GRANT ALL ON DATABASE "$db" TO supabase_storage_admin;
+GRANT ALL ON DATABASE "$db" TO supabase_auth_admin;
+GRANT ALL ON DATABASE "$db" TO postgres;
+GRANT CONNECT ON DATABASE "$db" TO authenticator;
+GRANT CONNECT ON DATABASE "$db" TO anon;
+GRANT CONNECT ON DATABASE "$db" TO authenticated;
+GRANT CONNECT ON DATABASE "$db" TO service_role;
+EOSQL
+
+    # Persist the new credential. Appended when absent, which is the normal
+    # case here — that is exactly what makes a project un-migrated.
+    local tmp_env
+    tmp_env=$(mktemp)
+    awk -v dbpw="$db_password" '
+        /^PROJECT_DB_PASSWORD=/ { print "PROJECT_DB_PASSWORD=" dbpw; seen=1; next }
+        { print }
+        END { if (!seen) print "PROJECT_DB_PASSWORD=" dbpw }
+    ' "$env_file" > "$tmp_env"
+    mv "$tmp_env" "$env_file"
+
+    sync_manifest
+
+    echo ""
+    echo "Migrated '$name'. Restart it so pg-meta picks up the new role:"
+    echo "  ./superbase2.sh down $name && ./superbase2.sh up $name"
 }
 
 cmd_rotate_keys() {
@@ -1039,21 +1283,43 @@ cmd_rotate_keys() {
         exit 1
     fi
 
-    local jwt_secret anon_key service_role_key
+    local jwt_secret anon_key service_role_key db_password
     jwt_secret=$(gen_base64 30)
     anon_key=$(gen_jwt "anon" "$jwt_secret")
     service_role_key=$(gen_jwt "service_role" "$jwt_secret")
 
-    echo "Rotating JWT secret + API keys for project '$name'..."
+    # Only roll the database password for projects that already have a role.
+    # Creating one here without transferring ownership would advertise a
+    # DATABASE_URL that authenticates but owns nothing — worse than leaving the
+    # shared credential in place. migrate-db-owner is the way in.
+    local has_db_role=0
+    if grep -q "^PROJECT_DB_PASSWORD=." "$env_file"; then
+        has_db_role=1
+        db_password=$(gen_hex 24)
+        echo "Rotating JWT secret + API keys + database password for project '$name'..."
+        # Roll the role's password first. If it fails, .env still matches the
+        # cluster, so the project keeps working and the run is a no-op.
+        _ensure_project_db_role "$db" "$db_password"
+    else
+        db_password=""
+        echo "Rotating JWT secret + API keys for project '$name'..."
+        echo "NOTE: '$name' has no per-project database role, so its database password"
+        echo "      is the shared POSTGRES_PASSWORD and is not rotated here."
+        echo "      Run './superbase2.sh migrate-db-owner $name' to give it its own."
+    fi
 
-    # Atomically rewrite the three secret lines in .env. Pass values via awk
+    # Atomically rewrite the secret lines in .env. Pass values via awk
     # variables to avoid sed-style escaping of '/', '+', '=' in JWTs.
+    # PROJECT_DB_PASSWORD is only touched when the project has a role (rolldb=1),
+    # so an un-migrated project keeps its .env free of an empty password line.
     local tmp_env
     tmp_env=$(mktemp)
-    awk -v jwt="$jwt_secret" -v anon="$anon_key" -v srk="$service_role_key" '
+    awk -v jwt="$jwt_secret" -v anon="$anon_key" -v srk="$service_role_key" \
+        -v dbpw="$db_password" -v rolldb="$has_db_role" '
         /^PROJECT_JWT_SECRET=/        { print "PROJECT_JWT_SECRET=" jwt; next }
         /^PROJECT_ANON_KEY=/          { print "PROJECT_ANON_KEY=" anon; next }
         /^PROJECT_SERVICE_ROLE_KEY=/  { print "PROJECT_SERVICE_ROLE_KEY=" srk; next }
+        /^PROJECT_DB_PASSWORD=/       { if (rolldb) { print "PROJECT_DB_PASSWORD=" dbpw } else { print }; next }
         { print }
     ' "$env_file" > "$tmp_env"
     mv "$tmp_env" "$env_file"
@@ -1646,7 +1912,8 @@ usage() {
     echo "  status [name]         Show container status"
     echo "  client-config <name>  Print client SDK configuration"
     echo "  rebuild-kong          Regenerate Kong config and reload"
-    echo "  rotate-keys <name>    Rotate JWT secret + anon/service_role keys (restarts containers)"
+    echo "  rotate-keys <name>    Rotate JWT secret + anon/service_role keys + database password (restarts containers)"
+    echo "  migrate-db-owner <name>  Give a pre-existing project its own database role (one-time backfill)"
     echo "  verify [name]        Check container JWT secrets match manifest"
 }
 
@@ -1685,6 +1952,10 @@ case "${1:-}" in
     rotate-keys)
         [ -z "${2:-}" ] && { echo "Error: project name required"; usage; exit 1; }
         cmd_rotate_keys "$2"
+        ;;
+    migrate-db-owner)
+        [ -z "${2:-}" ] && { echo "Error: project name required"; usage; exit 1; }
+        cmd_migrate_db_owner "$2"
         ;;
     verify)
         cmd_verify "${2:-}"

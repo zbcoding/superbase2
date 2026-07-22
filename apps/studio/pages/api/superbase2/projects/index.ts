@@ -1,8 +1,18 @@
 import type { NextApiRequest, NextApiResponse } from 'next'
 
-import { requireAuth, checkCsrf } from '@/lib/superbase2/auth'
-import { checkPostgresConnection, createProjectDatabase, isValidProjectName } from '@/lib/superbase2/db'
-import { addProjectIfNotExists, generateProjectSecrets, isSuperBase2Enabled, listProjects, removeProject } from '@/lib/superbase2/projects'
+import { checkCsrf, requireAuth } from '@/lib/superbase2/auth'
+import {
+  checkPostgresConnection,
+  createProjectDatabase,
+  isValidProjectName,
+} from '@/lib/superbase2/db'
+import {
+  addProjectIfNotExists,
+  generateProjectSecrets,
+  isSuperBase2Enabled,
+  listProjects,
+  removeProject,
+} from '@/lib/superbase2/projects'
 import {
   clampPagination,
   toCreationResponse,
@@ -88,11 +98,16 @@ async function handleCreate(req: NextApiRequest, res: NextApiResponse) {
       await createProjectDatabase(
         project.db,
         project.jwt_secret,
+        project.db_password,
         process.env.JWT_EXPIRY || '3600'
       )
     } catch (dbErr) {
       // Roll back the manifest entry if DB creation fails
-      try { await removeProject(project.ref) } catch { /* don't mask the original error */ }
+      try {
+        await removeProject(project.ref)
+      } catch {
+        /* don't mask the original error */
+      }
       throw dbErr
     }
 
