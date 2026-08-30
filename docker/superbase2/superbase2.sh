@@ -543,7 +543,7 @@ _init_project_db() {
     # Uses an unquoted heredoc so $db_name, $safe_jwt_secret, and $jwt_exp
     # are expanded by the shell. The only literal $ needed is in \$user
     # (the Postgres search_path variable), which is escaped with backslash.
-    docker exec -i "$db_ctr" psql -U supabase_admin -d "$db_name" <<EOSQL
+    docker exec -i "$db_ctr" psql -U supabase_admin -v ON_ERROR_STOP=1 -d "$db_name" <<EOSQL
 -- Set JWT config
 ALTER DATABASE "$db_name" SET "app.settings.jwt_secret" TO '$safe_jwt_secret';
 ALTER DATABASE "$db_name" SET "app.settings.jwt_exp" TO '$jwt_exp';
@@ -630,6 +630,74 @@ ALTER DATABASE "$db_name" SET search_path TO "\$user", public, extensions;
 GRANT USAGE ON SCHEMA extensions TO anon, authenticated, service_role;
 GRANT USAGE ON SCHEMA extensions TO "$db_name";
 GRANT USAGE ON SCHEMA graphql_public TO "$db_name";
+
+-- PostgREST schema-cache invalidation. The supabase/postgres image installs
+-- these into the `postgres` database at cluster init only; a project database
+-- created later inherits template1 and gets none of them, so PostgREST never
+-- reloads its schema cache until its container restarts. Definitions copied
+-- verbatim from the image's init migration.
+CREATE OR REPLACE FUNCTION extensions.pgrst_ddl_watch()
+ RETURNS event_trigger
+ LANGUAGE plpgsql
+AS \$\$
+DECLARE
+  cmd record;
+BEGIN
+  FOR cmd IN SELECT * FROM pg_event_trigger_ddl_commands()
+  LOOP
+    IF cmd.command_tag IN (
+      'CREATE SCHEMA', 'ALTER SCHEMA'
+    , 'CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO', 'ALTER TABLE'
+    , 'CREATE FOREIGN TABLE', 'ALTER FOREIGN TABLE'
+    , 'CREATE VIEW', 'ALTER VIEW'
+    , 'CREATE MATERIALIZED VIEW', 'ALTER MATERIALIZED VIEW'
+    , 'CREATE FUNCTION', 'ALTER FUNCTION'
+    , 'CREATE TRIGGER'
+    , 'CREATE TYPE', 'ALTER TYPE'
+    , 'CREATE RULE'
+    , 'COMMENT'
+    )
+    -- don't notify in case of CREATE TEMP table or other objects created on pg_temp
+    AND cmd.schema_name is distinct from 'pg_temp'
+    THEN
+      NOTIFY pgrst, 'reload schema';
+    END IF;
+  END LOOP;
+END; \$\$;
+
+CREATE OR REPLACE FUNCTION extensions.pgrst_drop_watch()
+ RETURNS event_trigger
+ LANGUAGE plpgsql
+AS \$\$
+DECLARE
+  obj record;
+BEGIN
+  FOR obj IN SELECT * FROM pg_event_trigger_dropped_objects()
+  LOOP
+    IF obj.object_type IN (
+      'schema'
+    , 'table'
+    , 'foreign table'
+    , 'view'
+    , 'materialized view'
+    , 'function'
+    , 'trigger'
+    , 'type'
+    , 'rule'
+    )
+    AND obj.is_temporary IS false -- no pg_temp objects
+    THEN
+      NOTIFY pgrst, 'reload schema';
+    END IF;
+  END LOOP;
+END; \$\$;
+
+-- CREATE EVENT TRIGGER has no IF NOT EXISTS, and this function is re-run on
+-- existing projects, so drop first.
+DROP EVENT TRIGGER IF EXISTS pgrst_ddl_watch;
+DROP EVENT TRIGGER IF EXISTS pgrst_drop_watch;
+CREATE EVENT TRIGGER pgrst_ddl_watch ON ddl_command_end EXECUTE PROCEDURE extensions.pgrst_ddl_watch();
+CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop EXECUTE PROCEDURE extensions.pgrst_drop_watch();
 EOSQL
 
     echo "Database '$db_name' initialized."
