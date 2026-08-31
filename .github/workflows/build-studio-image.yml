@@ -2,7 +2,7 @@ name: Build & Push Studio Image
 
 on:
   push:
-    branches: [master]
+    branches: [master, development]
     paths:
       - 'packages/pg-meta/**'
       - 'apps/studio/**'
@@ -46,8 +46,11 @@ jobs:
           file: apps/studio/Dockerfile
           target: production
           push: true
+          # master owns :latest (what production pulls); every other branch
+          # gets a moving tag named after itself, so a development build can
+          # never overwrite the image production is running.
           tags: |
-            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name == 'master' && 'latest' || github.ref_name }}
             ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -65,7 +68,7 @@ jobs:
         if: success()
         run: |
           IMAGE_SHA="${IMAGE_REGISTRY}/${IMAGE_NAME}:${{ github.sha }}"
-          IMAGE_LATEST="${IMAGE_REGISTRY}/${IMAGE_NAME}:latest"
+          IMAGE_LATEST="${IMAGE_REGISTRY}/${IMAGE_NAME}:${{ github.ref_name == 'master' && 'latest' || github.ref_name }}"
           docker pull "$IMAGE_SHA" >/dev/null
           CREATED=$(docker inspect "$IMAGE_SHA" --format '{{.Created}}')
           DIGEST=$(docker inspect "$IMAGE_SHA" --format '{{index .RepoDigests 0}}')
