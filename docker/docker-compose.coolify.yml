@@ -18,7 +18,9 @@
 # Full reference: docker/.env.example
 #
 # ── Changes vs upstream docker-compose.yml ──
-# • studio: uses pre-built ghcr.io image (built by CI on every push to master)
+# • studio: uses pre-built ghcr.io image (built by CI on push to master and
+#   development). master publishes :latest, development publishes :development;
+#   pick one with STUDIO_IMAGE_TAG, which defaults to latest.
 # • studio: adds SUPERBASE2_* env vars and manifest volume mount
 # • superbase2-init: one-shot container that bootstraps projects.json
 #
@@ -32,7 +34,7 @@ services:
   # ────────────────────────────────────────────────────────────────────────────
   studio:
     container_name: supabase-studio
-    image: ghcr.io/zbcoding/superbase2-studio:latest
+    image: ghcr.io/zbcoding/superbase2-studio:${STUDIO_IMAGE_TAG:-latest}
     pull_policy: always
     restart: unless-stopped
     expose:

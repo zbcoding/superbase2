@@ -130,7 +130,7 @@ services:
   studio:
     container_name: supabase-studio
     # Pre-built image from CI (pushed on every merge to master)
-    image: ghcr.io/zbcoding/superbase2-studio:latest
+    image: ghcr.io/zbcoding/superbase2-studio:${STUDIO_IMAGE_TAG:-latest}
     # To build from source instead, comment out the image line above and uncomment:
     # build:
     #   context: ..
