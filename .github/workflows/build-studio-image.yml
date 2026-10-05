@@ -60,6 +60,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # A missing secret would otherwise skip the redeploy without a trace.
+      - name: Warn when no Coolify webhook is set for this branch
+        if: success() && env.COOLIFY_WEBHOOK == '' && (github.ref_name == 'master' || github.ref_name == 'development')
+        run: |
+          echo "::warning title=Coolify redeploy skipped::Repository secret ${{ github.ref_name == 'master' && 'COOLIFY_WEBHOOK' || 'COOLIFY_WEBHOOK_DEVELOPMENT' }} is not set, so Coolify was not redeployed with this image."
+
       # Pin the Coolify app to the image this run just built, then redeploy.
       # A moving tag (:latest / :development) lets a redeploy pull a Studio
       # built from a different commit than the compose file and agent it runs

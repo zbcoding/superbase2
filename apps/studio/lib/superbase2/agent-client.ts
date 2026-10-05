@@ -16,12 +16,6 @@ export interface AgentResult {
   stderr: string
 }
 
-export interface AgentRestartResult {
-  ok: boolean
-  down: AgentResult
-  up: AgentResult
-}
-
 export type LifecycleAction = 'up' | 'down' | 'restart' | 'status' | 'rotate-keys' | 'destroy'
 
 export function isAgentConfigured(): boolean {
@@ -31,7 +25,9 @@ export function isAgentConfigured(): boolean {
 /**
  * Default per-action timeouts. `up` can take several minutes on first boot
  * because docker has to pull images; `restart` is bounded by `down` + `up`.
- * `down`/`status` should always be fast.
+ * `down`/`status` should always be fast. A timeout only aborts this request:
+ * the agent keeps running the script, which may still be waiting for another
+ * command's state lock (SB2_LOCK_TIMEOUT, 15 minutes by default).
  */
 const DEFAULT_TIMEOUTS: Record<LifecycleAction, number> = {
   up: 600_000,
@@ -53,7 +49,7 @@ export async function callAgent(
   action: LifecycleAction,
   projectName: string,
   { timeoutMs }: { timeoutMs?: number } = {}
-): Promise<AgentResult | AgentRestartResult> {
+): Promise<AgentResult> {
   const effectiveTimeout = timeoutMs ?? DEFAULT_TIMEOUTS[action]
   const base = process.env.SB2_AGENT_URL
   const token = process.env.SB2_AGENT_TOKEN
@@ -82,11 +78,11 @@ export async function callAgent(
     try { body = text ? JSON.parse(text) : {} } catch { body = { stdout: '', stderr: text } }
 
     // Any parseable body is fine to return — the route maps ok:false to 500.
-    return body as AgentResult | AgentRestartResult
+    return body as AgentResult
   } catch (err) {
     if (err instanceof AgentUnavailableError) throw err
-    if ((err as { name?: string }).name === 'AbortError') {
-      throw new AgentUnavailableError(`SB2 agent timed out after ${effectiveTimeout}ms`)
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new AgentTimeoutError(`SB2 agent timed out after ${effectiveTimeout}ms`)
     }
     throw new AgentUnavailableError(
       `SB2 agent request failed: ${err instanceof Error ? err.message : String(err)}`
@@ -134,5 +130,13 @@ export class AgentUnavailableError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'AgentUnavailableError'
+  }
+}
+
+/** The request timed out. The agent may still be running (or waiting to run) the action. */
+export class AgentTimeoutError extends AgentUnavailableError {
+  constructor(message: string) {
+    super(message)
+    this.name = 'AgentTimeoutError'
   }
 }

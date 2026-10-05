@@ -59,8 +59,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   try {
     const result = await callAgent(action, project.name)
-    const ok = Boolean((result as { ok?: boolean }).ok)
-    return res.status(ok ? 200 : 500).json({ action, ...result })
+    return res.status(result.ok === true ? 200 : 500).json({ action, ...result })
   } catch (err) {
     if (err instanceof AgentUnavailableError) {
       return res.status(503).json({ error: { message: err.message } })

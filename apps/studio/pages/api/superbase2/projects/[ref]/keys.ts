@@ -68,8 +68,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       // Without the split the browser saw a 502 even though the rotation
       // had succeeded on disk.
       const result = await callAgent('rotate-keys', project.name)
-      const ok = Boolean((result as { ok?: boolean }).ok)
-      if (!ok) {
+      if (result.ok !== true) {
         return res.status(500).json({ action: 'rotate-keys', ...result })
       }
       // Re-read the manifest so the response carries the freshly rotated values.

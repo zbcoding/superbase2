@@ -2,10 +2,10 @@ import type { NextApiRequest, NextApiResponse } from 'next'
 
 import { requireAuth, checkCsrf } from '@/lib/superbase2/auth'
 import {
+  AgentTimeoutError,
   AgentUnavailableError,
   callAgent,
   isAgentConfigured,
-  type AgentResult,
 } from '@/lib/superbase2/agent-client'
 import { dropProjectDatabase } from '@/lib/superbase2/db'
 import {
@@ -100,7 +100,7 @@ async function handleDelete(_req: NextApiRequest, res: NextApiResponse, ref: str
   // confirmed deletion intent, so we shouldn't block on agent health.
   if (isAgentConfigured()) {
     try {
-      const result = (await callAgent('destroy', project.name)) as AgentResult
+      const result = await callAgent('destroy', project.name)
       if (!result.ok) {
         const detail = (result.stderr || result.stdout || '').trim().slice(0, 300)
         warnings.push(
@@ -108,6 +108,17 @@ async function handleDelete(_req: NextApiRequest, res: NextApiResponse, ref: str
         )
       }
     } catch (err) {
+      // The agent is still running the destroy (or waiting for another
+      // command to release the state lock). Dropping the DB now would race the
+      // project's still-running containers, so leave it to the agent; a retry
+      // after it finishes removes the manifest entry.
+      if (err instanceof AgentTimeoutError) {
+        return res.status(504).json({
+          error: {
+            message: `Deleting '${project.name}' is taking longer than expected and is still running on the server. Try deleting the project again in a few minutes to finish.`,
+          },
+        })
+      }
       warnings.push(
         `Could not destroy the project stack via sb2-agent (${
           err instanceof AgentUnavailableError ? err.message : 'unknown error'
