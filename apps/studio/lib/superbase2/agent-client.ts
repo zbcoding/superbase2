@@ -22,7 +22,7 @@ export interface AgentRestartResult {
   up: AgentResult
 }
 
-export type LifecycleAction = 'up' | 'down' | 'restart' | 'status' | 'rotate-keys'
+export type LifecycleAction = 'up' | 'down' | 'restart' | 'status' | 'rotate-keys' | 'destroy'
 
 export function isAgentConfigured(): boolean {
   return Boolean(process.env.SB2_AGENT_URL && process.env.SB2_AGENT_TOKEN)
@@ -40,6 +40,8 @@ const DEFAULT_TIMEOUTS: Record<LifecycleAction, number> = {
   status: 15_000,
   // rotate-keys runs sync_manifest + rebuild-kong + down + up; cap matches up.
   'rotate-keys': 600_000,
+  // destroy runs compose down -v, drops the DB and role, then rebuild-kong.
+  destroy: 120_000,
 }
 
 /**
@@ -92,6 +94,40 @@ export async function callAgent(
   } finally {
     clearTimeout(timer)
   }
+}
+
+/**
+ * Images the main stack's services are currently running, keyed by compose
+ * service name (e.g. `{ auth: 'supabase/gotrue:v2.186.0' }`).
+ */
+export async function getMainStackImages(): Promise<Record<string, string>> {
+  const base = process.env.SB2_AGENT_URL
+  const token = process.env.SB2_AGENT_TOKEN
+  if (!base || !token) {
+    throw new AgentUnavailableError('SB2 agent is not configured')
+  }
+
+  let res: Response
+  try {
+    res = await fetch(`${base.replace(/\/$/, '')}/images`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(15_000),
+    })
+  } catch (err) {
+    throw new AgentUnavailableError(
+      `SB2 agent request failed: ${err instanceof Error ? err.message : String(err)}`
+    )
+  }
+  const body = (await res.json().catch(() => null)) as {
+    images?: Record<string, string>
+    error?: { message?: string }
+  } | null
+  if (!res.ok || !body?.images) {
+    throw new AgentUnavailableError(
+      `SB2 agent could not list images: ${body?.error?.message ?? `HTTP ${res.status}`}`
+    )
+  }
+  return body.images
 }
 
 export class AgentUnavailableError extends Error {

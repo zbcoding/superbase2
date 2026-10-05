@@ -87,13 +87,6 @@ export const RouteValidationWrapper = ({ children }: PropsWithChildren<{}>) => {
 
     // A successful request to project details will validate access to both project and branches
     if (!!ref && isErrorProject) {
-      console.log('[SB2 debug] project error', {
-        ref,
-        code: projectError?.code,
-        message: projectError?.message,
-        name: (projectError as any)?.name,
-        raw: projectError,
-      })
       // 404 = project no longer exists (e.g. was deleted)
       // 400 = ref doesn't match the SB2 ref format (e.g. legacy "default" bookmark)
       // Neither is an access error — don't toast.

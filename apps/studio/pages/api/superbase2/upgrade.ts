@@ -1,7 +1,6 @@
-import fs from 'fs'
-import path from 'path'
 import type { NextApiRequest, NextApiResponse } from 'next'
 
+import { AgentUnavailableError, getMainStackImages } from '@/lib/superbase2/agent-client'
 import { requireAuth } from '@/lib/superbase2/auth'
 import { isSuperBase2Enabled } from '@/lib/superbase2/projects'
 
@@ -10,8 +9,11 @@ import { isSuperBase2Enabled } from '@/lib/superbase2/projects'
  *
  * GET  /api/superbase2/upgrade — check for upstream Supabase updates
  *
- * Parses the compose file at runtime to discover current image tags,
- * then checks Docker Hub for newer versions.
+ * Compares the images the main stack is running (read from Docker by the
+ * sb2-agent) with the versions upstream pins in its self-hosting compose
+ * files. Upstream's pins are versions Supabase tested together; the newest
+ * tag on Docker Hub is not, and can be a major version the stack can't
+ * run (e.g. a Postgres major upgrade).
  */
 
 interface ImageStatus {
@@ -19,155 +21,81 @@ interface ImageStatus {
   current: string | null
   latest: string | null
   updateAvailable: boolean
-  error?: string
 }
 
-const COMPOSE_PATH = process.env.SUPERBASE2_COMPOSE_FILE || '/etc/superbase2/docker-compose.yml'
+const UPSTREAM_COMPOSE_BASE = 'https://raw.githubusercontent.com/supabase/supabase/master/docker'
 
-// Services to skip when checking for updates (not real Supabase services)
-const SKIP_SERVICES = new Set(['superbase2-init'])
+// Every upstream compose file that pins an image the SuperBase² stacks run.
+// pg15/pg17 both pin supabase/postgres; the one matching the running major wins.
+const UPSTREAM_COMPOSE_FILES = [
+  'docker-compose.yml',
+  'docker-compose.kong.yml',
+  'docker-compose.logs.yml',
+  'docker-compose.pg15.yml',
+  'docker-compose.pg17.yml',
+]
 
-/**
- * Parse service→image mappings from a docker-compose YAML file.
- * Uses a simple line-by-line parser to avoid requiring a YAML library.
- *
- * Handles both spaces (2-space indent) and tabs. Tracks the `services:`
- * block to avoid matching non-service keys.
- */
-function parseComposeImages(composePath: string): Record<string, string> {
-  let content: string
-  try {
-    content = fs.readFileSync(composePath, 'utf-8')
-  } catch {
-    return {}
+function splitImage(image: string): { repo: string; tag: string | null } {
+  const withoutDigest = image.split('@')[0]
+  const colon = withoutDigest.lastIndexOf(':')
+  // A colon before the last slash is a registry port, not a tag.
+  if (colon === -1 || colon < withoutDigest.lastIndexOf('/')) {
+    return { repo: withoutDigest, tag: null }
   }
-
-  const images: Record<string, string> = {}
-  let currentService: string | null = null
-  let inServices = false
-  // Detected indent string for service names (e.g. "  " or "    " or "\t").
-  // Derived from the first service line so both 2-space (standalone compose)
-  // and 4-space (Coolify-generated compose) files parse correctly.
-  let serviceIndent: string | null = null
-
-  for (const line of content.split('\n')) {
-    // Detect top-level 'services:' key (no indent) — allow trailing comments
-    if (/^services:\s*(#.*)?$/.test(line)) {
-      inServices = true
-      serviceIndent = null
-      continue
-    }
-
-    // Another top-level key ends the services block
-    if (inServices && /^\S/.test(line) && !line.startsWith('#')) {
-      inServices = false
-      currentService = null
-      serviceIndent = null
-      continue
-    }
-
-    if (!inServices) continue
-
-    // Service definition: exactly one indent level + name + colon (no value).
-    // Auto-detect the indent width from the first service line so 2-space
-    // (standalone compose) and 4-space (Coolify-generated) files both work.
-    if (serviceIndent === null) {
-      const firstSvc = line.match(/^( +|\t)([a-zA-Z0-9_-]+):\s*(#.*)?$/)
-      if (firstSvc) serviceIndent = firstSvc[1]
-    }
-    if (serviceIndent !== null && line.startsWith(serviceIndent)) {
-      // Remainder after stripping exactly serviceIndent must be "name:" with no value
-      const remainder = line.slice(serviceIndent.length)
-      const svcMatch = remainder.match(/^([a-zA-Z0-9_-]+):\s*(#.*)?$/)
-      if (svcMatch) {
-        currentService = svcMatch[1]
-        continue
-      }
-    }
-
-    // Image line under a service: deeper indent + "image:"
-    // Strip inline comments before extracting the image value
-    const imgMatch = line.match(/^[ \t]+image:\s*(.+?)(\s+#.*)?$/)
-    if (imgMatch && currentService) {
-      if (!SKIP_SERVICES.has(currentService)) {
-        images[currentService] = imgMatch[1].trim()
-      }
-      // Reset regardless of skip — prevents stale currentService
-      currentService = null
-    }
-  }
-
-  return images
+  return { repo: withoutDigest.slice(0, colon), tag: withoutDigest.slice(colon + 1) }
 }
 
-/**
- * Compare two semver-like version strings (e.g. "v2.186.0", "1.37.8").
- * Returns >0 if a > b, <0 if a < b, 0 if equal.
- */
-function compareSemver(a: string, b: string): number {
-  const parse = (v: string) =>
-    v
-      .replace(/^v/, '')
-      .split('.')
-      .map((p) => {
-        const n = parseInt(p, 10)
-        return isNaN(n) ? 0 : n
+/** repo → every tag upstream pins for it. */
+async function fetchUpstreamPins(): Promise<Map<string, string[]>> {
+  const pins = new Map<string, string[]>()
+  const files = await Promise.all(
+    UPSTREAM_COMPOSE_FILES.map(async (file) => {
+      const res = await fetch(`${UPSTREAM_COMPOSE_BASE}/${file}`, {
+        signal: AbortSignal.timeout(5000),
       })
-  const pa = parse(a)
-  const pb = parse(b)
+      if (!res.ok) throw new Error(`Fetching upstream ${file} failed: HTTP ${res.status}`)
+      return res.text()
+    })
+  )
+  for (const content of files) {
+    for (const match of content.matchAll(/^\s*image:\s*['"]?([^\s'"#]+)/gm)) {
+      const { repo, tag } = splitImage(match[1])
+      if (!tag) continue
+      pins.set(repo, [...(pins.get(repo) ?? []), tag])
+    }
+  }
+  return pins
+}
+
+function versionParts(tag: string): number[] {
+  return tag
+    .replace(/^v/, '')
+    .replace(/-.*$/, '')
+    .split('.')
+    .map((p) => parseInt(p, 10) || 0)
+}
+
+/** >0 if a > b, <0 if a < b, 0 if equal. */
+function compareVersions(a: string, b: string): number {
+  const pa = versionParts(a)
+  const pb = versionParts(b)
   for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const diff = (pa[i] || 0) - (pb[i] || 0)
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0)
     if (diff !== 0) return diff
   }
   return 0
 }
 
-async function fetchLatestTag(image: string): Promise<string | null> {
-  // Strip digest suffix (e.g. "@sha256:abc") before splitting on ':',
-  // otherwise the repo portion becomes "org/name@sha256" which is an invalid API path.
-  const imageWithoutDigest = image.split('@')[0]
-  // Extract org/repo and current tag prefix from image string
-  // e.g. "supabase/gotrue:v2.186.0" → repo="supabase/gotrue", prefix="v"
-  const [repo, currentTag] = imageWithoutDigest.split(':')
-  const prefix = currentTag?.match(/^(v?)\d/)?.[1] || ''
-
-  try {
-    // Fetch recent tags from Docker Hub, sorted by last_updated
-    const res = await fetch(
-      `https://hub.docker.com/v2/repositories/${repo}/tags/?page_size=25&ordering=last_updated`,
-      { signal: AbortSignal.timeout(5000) }
-    )
-
-    if (res.status === 429) throw new Error('rate-limited')
-    if (!res.ok) return null
-
-    const data = await res.json()
-    if (!data || !Array.isArray(data.results)) return null
-    const tags: { name: string }[] = (data.results as unknown[]).filter(
-      (t): t is { name: string } =>
-        t !== null && typeof t === 'object' && typeof (t as any).name === 'string'
-    )
-    if (tags.length === 0) return null
-
-    // Filter to version-like tags matching the same prefix pattern.
-    // Accepts semver (v1.2.3), CalVer (2026.02.16), and SHA-suffixed tags (2026.02.16-sha-xxx).
-    // Excludes "latest", plain SHA tags, and other non-version tags.
-    const semverPattern = new RegExp(`^${prefix}\\d+\\.\\d+\\.\\d+(-sha-[a-f0-9]+)?$`)
-    const semverTags = tags
-      .map((t) => t.name)
-      .filter((name) => semverPattern.test(name))
-      // Strip SHA suffix for comparison — sort by version part only
-      .map((name) => ({ full: name, version: name.replace(/-sha-[a-f0-9]+$/, '') }))
-
-    if (semverTags.length === 0) return null
-
-    // Find the highest version
-    semverTags.sort((a, b) => compareSemver(b.version, a.version))
-    return `${repo}:${semverTags[0].full}`
-  } catch (err) {
-    if (err instanceof Error && err.message === 'rate-limited') throw err
-    return null
-  }
+/**
+ * Upstream's pin for the same major version as `current`, or null. A major
+ * version change (Postgres 15 → 17, or a 1.x → 2.x service) needs a migration
+ * and is never offered as a routine update.
+ */
+function upstreamPinFor(current: string, candidates: string[]): string | null {
+  const major = versionParts(current)[0]
+  const sameMajor = candidates.filter((tag) => versionParts(tag)[0] === major)
+  if (sameMajor.length === 0) return null
+  return sameMajor.sort((a, b) => compareVersions(b, a))[0]
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -181,12 +109,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(405).json({ error: { message: `Method ${req.method} Not Allowed` } })
   }
 
-  // Validate the raw path before resolving — path.resolve() produces an absolute
-  // path that never contains '..', so the check must happen before resolution.
-  if (COMPOSE_PATH.includes('..')) {
-    return res.status(500).json({ error: { message: 'Invalid compose file path' } })
-  }
-  const composePath = path.resolve(COMPOSE_PATH)
   const composeCmd =
     process.env.SUPERBASE2_COMPOSE_CMD ||
     'docker compose -f docker-compose.yml -f docker-compose.superbase2.yml'
@@ -197,50 +119,39 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   // undone by the next redeploy. Coolify always injects COOLIFY_RESOURCE_UUID.
   const isCoolifyDeployment = Boolean(process.env.COOLIFY_RESOURCE_UUID)
 
-  const currentImages = parseComposeImages(composePath)
+  let currentImages: Record<string, string>
+  try {
+    currentImages = await getMainStackImages()
+  } catch (err) {
+    const message =
+      err instanceof AgentUnavailableError ? err.message : 'Could not read running images'
+    return res.status(503).json({ error: { message } })
+  }
 
-  if (Object.keys(currentImages).length === 0) {
-    return res.status(500).json({
-      error: { message: 'Could not read compose file' },
+  let pins: Map<string, string[]>
+  try {
+    pins = await fetchUpstreamPins()
+  } catch (err) {
+    return res.status(502).json({
+      error: { message: err instanceof Error ? err.message : 'Could not fetch upstream versions' },
     })
   }
 
-  // Check all images in parallel
-  const results: ImageStatus[] = await Promise.all(
-    Object.entries(currentImages).map(async ([service, currentImage]) => {
-      const currentTag = currentImage.split(':')[1] ?? null
-      let latest: string | null = null
-      let error: string | undefined
-
-      try {
-        latest = await fetchLatestTag(currentImage)
-      } catch (err: unknown) {
-        error =
-          err instanceof Error && err.message === 'rate-limited'
-            ? 'Docker Hub rate limit reached — try again later'
-            : 'Failed to fetch latest tag'
-      }
-
-      const latestTag = latest?.split(':')[1] ?? null
-
-      // Compare version cores (strip SHA suffix) to avoid false positives
-      // where the same version has a different SHA rebuild
-      const currentCore = currentTag?.replace(/-sha-[a-f0-9]+$/, '') ?? ''
-      const latestCore = latestTag?.replace(/-sha-[a-f0-9]+$/, '') ?? ''
-
-      return {
-        service,
-        current: currentTag,
-        latest: latestTag,
-        updateAvailable:
-          currentTag !== null &&
-          latestTag !== null &&
-          latestCore !== currentCore &&
-          compareSemver(latestCore, currentCore) > 0,
-        ...(error && { error }),
-      }
+  const results: ImageStatus[] = []
+  for (const [service, image] of Object.entries(currentImages)) {
+    const { repo, tag } = splitImage(image)
+    const candidates = pins.get(repo)
+    // Images upstream doesn't pin (the SuperBase² Studio and agent, alpine
+    // one-shots) have nothing to compare against.
+    if (!tag || !candidates) continue
+    const latest = upstreamPinFor(tag, candidates)
+    results.push({
+      service,
+      current: tag,
+      latest,
+      updateAvailable: latest !== null && compareVersions(latest, tag) > 0,
     })
-  )
+  }
 
   const hasUpdates = results.some((r) => r.updateAvailable)
 
@@ -252,10 +163,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         ? ['git pull upstream master', `${composeCmd} pull`, `${composeCmd} up -d`]
         : null,
     // Rendered as prose, not as a copyable command block — on Coolify the upgrade
-    // is a button in its UI, so there is nothing to paste into a shell.
+    // is a button in its UI, so there is nothing to paste into a shell. The tags
+    // are pinned in docker-compose.coolify.yml, so redeploying alone re-pulls the
+    // same versions.
     upgradeNote:
       hasUpdates && isCoolifyDeployment
-        ? 'Redeploy the application in Coolify to pull the new images.'
+        ? 'Update the image tags in docker/docker-compose.coolify.yml to these versions, push, and redeploy in Coolify. Running projects switch to the new images automatically once the stack is up.'
         : null,
   })
 }

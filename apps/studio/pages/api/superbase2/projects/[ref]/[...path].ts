@@ -33,7 +33,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   if (!isValidProjectRef(ref)) {
-    console.log('[SB2 debug] catchall invalid ref rejected', { ref, subPath, method: req.method, url: req.url })
     return res.status(404).json({ error: { message: 'Project not found' } })
   }
 

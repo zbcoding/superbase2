@@ -25,7 +25,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   const ref = req.query.ref as string
   if (!isValidProjectRef(ref)) {
-    console.log('[SB2 debug] invalid ref rejected', { ref, method: req.method, url: req.url })
     // 404 (not 400) so Studio's RouteValidationWrapper silently redirects to
     // DEFAULT_HOME instead of toasting "You do not have access to this project".
     // Catches legacy /project/default bookmarks from pre-SB2 self-hosted installs.
@@ -92,29 +91,32 @@ async function handleDelete(_req: NextApiRequest, res: NextApiResponse, ref: str
 
   const warnings: string[] = []
 
-  // Best-effort: stop per-project containers via the agent before dropping the
-  // DB, so auto-restarting services can't reconnect mid-drop. If the agent is
-  // unavailable, fall through with a warning — the caller already confirmed
-  // deletion intent, so we shouldn't block on agent health.
+  // Best-effort: have the agent destroy the project's stack before dropping the
+  // DB — containers (so auto-restarting services can't reconnect mid-drop),
+  // storage/functions volumes, the on-disk .env/compose files and its Kong
+  // routes. Removing only the manifest entry would leave the disk state behind,
+  // and the next manifest sync would bring the deleted project back. If the
+  // agent is unavailable, fall through with a warning — the caller already
+  // confirmed deletion intent, so we shouldn't block on agent health.
   if (isAgentConfigured()) {
     try {
-      const result = (await callAgent('down', project.name, { timeoutMs: 60_000 })) as AgentResult
+      const result = (await callAgent('destroy', project.name)) as AgentResult
       if (!result.ok) {
         const detail = (result.stderr || result.stdout || '').trim().slice(0, 300)
         warnings.push(
-          `sb2-agent reported 'down' failed (exit ${result.exit_code})${detail ? `: ${detail}` : ''}. Containers may still be running; the DB drop below may fail if they reconnect.`
+          `sb2-agent reported 'destroy' failed (exit ${result.exit_code})${detail ? `: ${detail}` : ''}. Containers may still be running; the DB drop below may fail if they reconnect.`
         )
       }
     } catch (err) {
       warnings.push(
-        `Could not stop containers via sb2-agent (${
+        `Could not destroy the project stack via sb2-agent (${
           err instanceof AgentUnavailableError ? err.message : 'unknown error'
-        }). If the drop fails, SSH in and run ./superbase2.sh down ${project.name} first.`
+        }). SSH in and run ./superbase2.sh destroy ${project.name} to remove its containers, volumes and files.`
       )
     }
   } else {
     warnings.push(
-      'sb2-agent not configured — per-project containers were not stopped. SSH in and run ./superbase2.sh down <name> if the drop fails.'
+      `sb2-agent not configured — the project's containers, volumes and files were not removed. SSH in and run ./superbase2.sh destroy ${project.name}.`
     )
   }
 

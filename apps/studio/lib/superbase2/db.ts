@@ -179,9 +179,8 @@ export async function createProjectDatabase(
       await client.query(`ALTER DATABASE "${safeName}" SET "app.settings.jwt_exp" TO '${jwtExp}'`)
 
       await client.query(`
-        -- Realtime schema
-        CREATE SCHEMA IF NOT EXISTS _realtime;
-        ALTER SCHEMA _realtime OWNER TO postgres;
+        -- The _realtime and realtime schemas are created on start by
+        -- _ensure_realtime_db() in superbase2.sh, owned by Realtime's own role.
 
         -- Storage schema
         CREATE SCHEMA IF NOT EXISTS storage;
@@ -308,5 +307,17 @@ export async function dropProjectDatabase(dbName: string): Promise<void> {
     // Pre-migration projects have no role, and a role still owning objects
     // elsewhere is not worth failing the delete over.
     console.error(`[SuperBase²] could not drop role '${safeName}':`, err)
+  }
+  // Realtime's own role (see _ensure_realtime_db in superbase2.sh). A role
+  // holding a parameter ACL cannot be dropped until the grant is revoked.
+  const rtRole = `${safeName}_rt`
+  try {
+    const { rowCount } = await pool.query(`SELECT 1 FROM pg_roles WHERE rolname = $1`, [rtRole])
+    if (rowCount) {
+      await pool.query(`REVOKE SET ON PARAMETER log_min_messages FROM "${rtRole}"`)
+      await pool.query(`DROP ROLE "${rtRole}"`)
+    }
+  } catch (err) {
+    console.error(`[SuperBase²] could not drop role '${rtRole}':`, err)
   }
 }

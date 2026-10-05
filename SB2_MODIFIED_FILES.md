@@ -16,7 +16,7 @@ This document is the authoritative list of **original Supabase files that SuperB
 | `apps/studio/lib/api/self-hosted/util.ts` | Self-hosted util helper. |
 | `apps/studio/components/interfaces/App/RouteValidationWrapper.tsx` | Bypass route validation when `SUPERBASE2_ENABLED`. |
 | `apps/studio/components/layouts/Navigation/LayoutHeader/LayoutHeader.tsx` | Header gating around `SUPERBASE2_ENABLED`. |
-| `apps/studio/data/fetchers.ts` | Stray `console.log('[SB2 debug] ...')` left in `handleError` from the removed GoTrue-auth debugging pass — no functional change, candidate for cleanup. |
+| `apps/studio/data/fetchers.ts` | Tolerates an error body of the form `{ error: { message } }` (the sb2 API routes' shape) in `handleError`, so their messages reach toasts instead of a generic fallback. |
 | `apps/studio/pages/sign-in.tsx` | Self-hosted redirect target after Kong basic-auth: `/organizations` when `SUPERBASE2_ENABLED` (sb2 has no `default` ref) vs `/project/default` upstream. |
 | `apps/studio/pages/project/[ref]/settings/general.tsx` | Self-hosted redirect uses the current `:ref` instead of hardcoded `default` (sb2 is multi-project). |
 | `apps/studio/components/interfaces/ProjectCreation/ProjectCreationForm.tsx` | Panel description copy: in sb2 mode, says only Project name is used and the other fields are ignored. Lived in `apps/studio/pages/new/[slug].tsx` until upstream extracted the wizard into this component. |
@@ -72,7 +72,7 @@ These are upstream platform routes that sb2 re-implements to be project-aware (r
 | File | What sb2 changes |
 |---|---|
 | `docker/dev/docker-compose.dev.yml` | Dev stack adjustments. |
-| `docker/docker-compose.coolify.yml` | Coolify deploy stack. `DB_ENC_KEY: ${DB_ENC_KEY}` (env-driven instead of the upstream `supabaserealtime` literal) so the Realtime tenant-encryption key is rotatable via a Coolify env var; plus Studio upgrade-endpoint wiring. |
+| `docker/docker-compose.coolify.yml` | Coolify deploy stack (SB2-only file; upstream has none): pre-merged `docker-compose.yml` + `docker-compose.superbase2.yml`, with the Kong gateway and baked-config init services Coolify needs. `DB_ENC_KEY: ${DB_ENC_KEY}` (env-driven instead of the upstream `supabaserealtime` literal) so the Realtime tenant-encryption key is rotatable via a Coolify env var. `db` also raises `max_connections`, `max_replication_slots` and `max_wal_senders` (per-project Realtime holds replication slots; override via `POSTGRES_MAX_*`). |
 | `docker/utils/generate-keys.sh` | Key generation for per-project secrets. |
 | `README.md` | sb2 documentation at the top, upstream README below. |
 | `.gitignore` | sb2-specific ignores. |
