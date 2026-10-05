@@ -1,6 +1,6 @@
 # sb2 project-database ownership & credential findings
 
-Investigated 2026-07-22 against the live server (`2.56.246.101`). All ownership and
+Investigated 2026-07-22 against a live server. All ownership and
 privilege data below was read from the running cluster, not inferred.
 
 ## Summary
