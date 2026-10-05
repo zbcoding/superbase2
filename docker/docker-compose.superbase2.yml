@@ -71,7 +71,11 @@ services:
       SB2_AGENT_URL: http://sb2-agent:8088
       SB2_AGENT_TOKEN: ${SB2_AGENT_TOKEN}
     volumes:
-      - ${SUPERBASE2_DIR:-./superbase2}/projects.json:/etc/superbase2/projects.json:z
+      # The directory, not the file: superbase2.sh and Studio both replace
+      # projects.json by rename (a single-file mount would keep showing the old
+      # inode, and Studio's rename onto it fails), and they share the
+      # projects.json.lock beside it.
+      - ${SUPERBASE2_DIR:-./superbase2}:/etc/superbase2:z
 
   # ─── SuperBase² Agent ─────────────────────────────────────────────────────
   # Host-Docker broker so Studio can start/stop/restart per-project stacks
@@ -112,7 +116,7 @@ services:
       ANON_KEY: ${ANON_KEY}
       SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
     volumes:
-      - ${SUPERBASE2_DIR:-./superbase2}/projects.json:/etc/superbase2/projects.json:z
+      - ${SUPERBASE2_DIR:-./superbase2}:/etc/superbase2:z
     entrypoint: /bin/sh
     command:
       - -c

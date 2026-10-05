@@ -272,13 +272,10 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (action === 'restart') {
-        const down = await runScript(['down', name])
-        const up = await runScript(['up', name])
-        return json(res, up.ok ? 200 : 500, {
-          ok: up.ok,
-          down,
-          up,
-        })
+        // One script run: it checks the main stack before stopping anything,
+        // so a restart during a redeploy can't leave the project stopped.
+        const result = await runScript(['restart', name])
+        return json(res, result.ok ? 200 : 500, result)
       }
 
       // rotate-keys runs the disk/DB/Kong work synchronously, then returns.
@@ -319,9 +316,9 @@ function getKongContainerName() {
   }
 }
 
-// Refs of the projects rebuild-kong generates routes for: those with a .env
-// under STATE_DIR/projects (same source as superbase2.sh list_projects).
-function expectedProjectRefs() {
+// Projects this agent manages: those with a .env under STATE_DIR/projects
+// (same source as superbase2.sh list_projects).
+function projectNamesOnDisk() {
   const projectsDir = `${STATE_DIR}/projects`
   let names
   try {
@@ -330,11 +327,16 @@ function expectedProjectRefs() {
     if (err.code === 'ENOENT') return []
     throw err
   }
+  return names.filter((name) => fs.existsSync(`${projectsDir}/${name}/.env`))
+}
+
+// Refs of the projects rebuild-kong generates routes for.
+function expectedProjectRefs() {
   const refs = []
-  for (const name of names) {
+  for (const name of projectNamesOnDisk()) {
     let env
     try {
-      env = fs.readFileSync(`${projectsDir}/${name}/.env`, 'utf8')
+      env = fs.readFileSync(`${STATE_DIR}/projects/${name}/.env`, 'utf8')
     } catch {
       continue
     }
@@ -417,50 +419,99 @@ function mainStackImages() {
   return images
 }
 
-// Per-project containers (compose project `supabase-<name>`) whose image
-// differs from the main-stack service they mirror, e.g. `auth-foo` vs `auth`.
+// This agent's per-project containers (compose project `supabase-<name>` for a
+// project on disk) whose image differs from the main-stack service they
+// mirror, e.g. `auth-foo` vs `auth`. Other `supabase-*` stacks on the host
+// (another sb2 install, orphans of a failed destroy) are not ours to fix:
+// reconcile can't change them, so counting them would reconcile forever.
 function driftedProjects() {
   const main = mainStackImages()
+  const ours = new Set(projectNamesOnDisk())
   const drifted = new Set()
   for (const c of inspectContainers(['label=com.docker.compose.project'])) {
     if (c.project === OWN_PROJECT || !c.project.startsWith('supabase-')) continue
     const name = c.project.slice('supabase-'.length)
-    if (!c.service.endsWith(`-${name}`)) continue
+    if (!ours.has(name) || !c.service.endsWith(`-${name}`)) continue
     const base = c.service.slice(0, -(name.length + 1))
     if (main[base] && main[base] !== c.image) drifted.add(name)
   }
   return [...drifted]
 }
 
-async function reconcile(reason) {
-  console.log(`[sb2-agent] reconciling per-project containers (${reason})...`)
-  const result = await runScript(['reconcile'])
-  if (result.ok) {
-    console.log('[sb2-agent] reconcile done:\n' + result.stdout)
-  } else {
-    console.error('[sb2-agent] reconcile FAILED:\n' + (result.stderr || result.stdout))
-  }
-}
-
-async function periodicCheck() {
-  let drifted = []
-  if (OWN_PROJECT) {
-    try {
-      drifted = driftedProjects()
-    } catch (err) {
-      console.error('[sb2-agent] image drift check failed:', err.message)
-    }
-  }
-  // reconcile rebuilds Kong too, so it covers the route check.
-  if (drifted.length > 0) {
-    await reconcile(`images differ from the main stack for ${drifted.join(', ')}`)
-  } else {
-    await ensureKongRoutes()
-  }
-}
-
 // Check every 5 minutes (Coolify can redeploy at any time)
 const CHECK_INTERVAL_MS = 5 * 60 * 1000
+const MAX_RETRY_DELAY_MS = 60 * 60 * 1000
+
+// A failed reconcile (main stack mid-redeploy, one broken project) is retried
+// even if no image drifted, since a template or env change would otherwise
+// never reach the projects. Full retries back off from 5 minutes to an hour,
+// so a project that keeps failing doesn't reload Kong every check. Meanwhile
+// drifted projects other than the failed ones are still reconciled on their
+// own, so one broken project can't hold back another's image update.
+let reconcileFailures = 0
+let nextReconcileAt = 0
+let failedProjects = new Set()
+
+// `names` empty = every started project (and the result decides the backoff).
+async function reconcile(reason, names = []) {
+  console.log(`[sb2-agent] reconciling per-project containers (${reason})...`)
+  const result = await runScript(['reconcile', ...names])
+  if (result.ok) {
+    if (names.length === 0) {
+      reconcileFailures = 0
+      failedProjects = new Set()
+    }
+    console.log('[sb2-agent] reconcile done:\n' + result.stdout)
+    return
+  }
+  const failed = (result.stderr.match(/^Error: failed to start project\(s\): (.+)$/m)?.[1] ?? '')
+    .split(' ')
+    .filter(Boolean)
+  for (const name of failed) failedProjects.add(name)
+  if (names.length > 0) {
+    console.error('[sb2-agent] reconcile FAILED:\n' + (result.stderr || result.stdout))
+    return
+  }
+  reconcileFailures += 1
+  const delay = Math.min(CHECK_INTERVAL_MS * 2 ** (reconcileFailures - 1), MAX_RETRY_DELAY_MS)
+  nextReconcileAt = Date.now() + delay
+  console.error(
+    `[sb2-agent] reconcile FAILED (attempt ${reconcileFailures}; retrying in ${Math.round(delay / 60000)} min):\n` +
+      (result.stderr || result.stdout)
+  )
+}
+
+let checkRunning = false
+
+async function periodicCheck() {
+  // A reconcile can outlast the interval (it waits for the main stack and the
+  // state lock); don't start another check on top of it.
+  if (checkRunning) return
+  checkRunning = true
+  try {
+    let drifted = []
+    if (OWN_PROJECT) {
+      try {
+        drifted = driftedProjects()
+      } catch (err) {
+        console.error('[sb2-agent] image drift check failed:', err.message)
+      }
+    }
+    // reconcile rebuilds Kong too, so it covers the route check.
+    if (reconcileFailures > 0 && Date.now() >= nextReconcileAt) {
+      await reconcile('retrying after a failed reconcile')
+    } else if (reconcileFailures === 0 && drifted.length > 0) {
+      await reconcile(`images differ from the main stack for ${drifted.join(', ')}`)
+    } else if (drifted.some((name) => !failedProjects.has(name))) {
+      const healthy = drifted.filter((name) => !failedProjects.has(name))
+      await reconcile(`images differ from the main stack for ${healthy.join(', ')}`, healthy)
+    } else {
+      await ensureKongRoutes()
+    }
+  } finally {
+    checkRunning = false
+  }
+}
 
 server.listen(PORT, async () => {
   console.log(`[sb2-agent] listening on :${PORT} (docker_dir=${DOCKER_DIR})`)

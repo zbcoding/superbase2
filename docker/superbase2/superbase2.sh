@@ -725,6 +725,10 @@ SELECT 'CREATE ROLE supabase_realtime_admin WITH NOINHERIT NOLOGIN NOREPLICATION
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supabase_realtime_admin') \gexec
 GRANT supabase_realtime_admin TO postgres;
 SELECT format('GRANT supabase_realtime_admin TO %I', :'rt') \gexec
+-- Marks the role for the login trigger installed by _block_realtime_roles_in_main_dbs.
+SELECT 'CREATE ROLE sb2_project_realtime NOLOGIN'
+ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sb2_project_realtime') \gexec
+SELECT format('GRANT sb2_project_realtime TO %I WITH INHERIT FALSE, SET FALSE', :'rt') \gexec
 
 \c :db
 -- CONNECT to log in; CREATE because PG15+ needs it for CREATE PUBLICATION.
@@ -849,9 +853,65 @@ BEGIN
 END $$;
 EOSQL
 
+    if [ "$version" -ge 170000 ]; then
+        _block_realtime_roles_in_main_dbs "$db_ctr"
+    fi
+
     _set_env_var "$env_file" PROJECT_REALTIME_DB_USER "$rt_user"
     _set_env_var "$env_file" PROJECT_REALTIME_DB_PASSWORD "$rt_password"
     _set_env_var "$env_file" PROJECT_REALTIME_SLOT_SUFFIX "$slot_suffix"
+}
+
+# Keep project Realtime roles out of the main stack's databases.
+#
+# PUBLIC holds CONNECT on `postgres` and `_supabase`, so a <db>_rt role could
+# log in there, SET ROLE service_role (it may, for RLS checks in its own
+# database) and read or write the main project's data, or open a logical
+# replication slot and stream its changes. A login event trigger (PostgreSQL
+# 17+) refuses members of sb2_project_realtime, including replication
+# connections. Revoking CONNECT from PUBLIC instead would cut off every role
+# the main stack and its users rely on.
+#
+# A login trigger that errors locks everyone out (recovery: start Postgres
+# with -c event_triggers=off), so the membership check cannot fail: it joins
+# on names and swallows errors. template1 is left alone, or every database
+# created from it would refuse its own project's Realtime role.
+_block_realtime_roles_in_main_dbs() {
+    local db_ctr="$1" main_db
+    for main_db in postgres _supabase; do
+        if ! docker exec "$db_ctr" psql -U supabase_admin -d postgres -tAc \
+                "SELECT 1 FROM pg_database WHERE datname = '$main_db'" | grep -q 1; then
+            continue
+        fi
+        docker exec -i "$db_ctr" psql -U supabase_admin -d "$main_db" -q -v ON_ERROR_STOP=1 <<'EOSQL'
+CREATE SCHEMA IF NOT EXISTS extensions;
+CREATE OR REPLACE FUNCTION extensions.sb2_block_project_realtime()
+ RETURNS event_trigger
+ LANGUAGE plpgsql
+ SET search_path = pg_catalog
+AS $fn$
+DECLARE
+  blocked boolean := false;
+BEGIN
+  BEGIN
+    SELECT EXISTS (
+      SELECT 1 FROM pg_auth_members m
+      JOIN pg_roles g ON g.oid = m.roleid
+      JOIN pg_roles u ON u.oid = m.member
+      WHERE g.rolname = 'sb2_project_realtime' AND u.rolname = session_user)
+    INTO blocked;
+  EXCEPTION WHEN OTHERS THEN
+    blocked := false;
+  END;
+  IF blocked THEN
+    RAISE EXCEPTION 'role "%" is a project Realtime role and may only connect to its project database', session_user;
+  END IF;
+END;
+$fn$;
+SELECT 'CREATE EVENT TRIGGER sb2_block_project_realtime ON login EXECUTE FUNCTION extensions.sb2_block_project_realtime()'
+ WHERE NOT EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = 'sb2_block_project_realtime') \gexec
+EOSQL
+    done
 }
 
 _init_project_db() {
@@ -1159,28 +1219,79 @@ cmd_list() {
     done
 }
 
+# Run "$1" once per remaining argument (a project name), each in its own
+# subshell, so one broken project can't stop the others. Projects that failed
+# are left in FAILED_PROJECTS. This must not be called from an if/&&/|| context:
+# bash then ignores `set -e` for everything underneath, even in a subshell that
+# turns it back on, and a failing step would be skipped instead of stopping
+# that project's run.
+FAILED_PROJECTS=()
+_for_each_project() {
+    local fn="$1" proj rc
+    shift
+    FAILED_PROJECTS=()
+    for proj in "$@"; do
+        set +e
+        ( set -e; "$fn" "$proj" )
+        rc=$?
+        set -e
+        if [ "$rc" -ne 0 ]; then
+            echo "Error: project '$proj' failed (exit $rc); continuing with the others." >&2
+            FAILED_PROJECTS+=("$proj")
+        fi
+    done
+}
+
+# Prepare disk state for every given project, rebuild Kong once, then start
+# them. A project that fails is reported and skipped; the run exits 1 at the
+# end if any did.
+_start_projects() {
+    local failed=() ready=() proj
+    _for_each_project _ensure_disk_state "$@"
+    failed=("${FAILED_PROJECTS[@]}")
+    for proj in "$@"; do
+        [[ " ${failed[*]} " == *" $proj "* ]] || ready+=("$proj")
+    done
+
+    cmd_rebuild_kong
+    _for_each_project _start_project "${ready[@]}"
+    failed+=("${FAILED_PROJECTS[@]}")
+
+    if [ ${#failed[@]} -gt 0 ]; then
+        echo "Error: failed to start project(s): ${failed[*]}" >&2
+        exit 1
+    fi
+}
+
 cmd_up() {
     local name="${1:-}"
 
     export_main_stack_images || exit 1
 
     if [ -z "$name" ]; then
-        # Start all projects — generate any missing disk state first, then rebuild
-        # Kong once and start all containers.
-        for proj in $(list_projects); do
-            _ensure_disk_state "$proj"
-        done
-        # Rebuild Kong once for all projects
-        cmd_rebuild_kong
-        for proj in $(list_projects); do
-            _start_project "$proj"
-        done
+        local all=()
+        read -r -a all <<< "$(list_projects | tr '\n' ' ')"
+        _start_projects "${all[@]}"
         return
     fi
 
     _ensure_disk_state "$name"
     cmd_rebuild_kong
     _start_project "$name"
+}
+
+# Stop and start a project. `up` refuses to start without the main stack's
+# images, so check them before stopping anything: a restart during a main-stack
+# redeploy must leave the project running, not stopped.
+cmd_restart() {
+    local name="$1"
+    if ! project_exists "$name"; then
+        echo "Error: Project '$name' does not exist."
+        exit 1
+    fi
+    export_main_stack_images || exit 1
+    cmd_down "$name"
+    cmd_up "$name"
 }
 
 # Bring per-project containers back in line with the main stack after it was
@@ -1191,10 +1302,14 @@ cmd_up() {
 #
 # Only projects that currently have containers (running or exited) are
 # recreated. `down` removes a project's containers, so a project the user
-# stopped stays stopped.
+# stopped stays stopped. Names limit the run to those projects (the agent
+# passes the drifted ones while a broken project's retries back off).
 cmd_reconcile() {
-    local started=()
+    local started=() proj
     for proj in $(list_projects); do
+        if [ $# -gt 0 ] && [[ " $* " != *" $proj "* ]]; then
+            continue
+        fi
         if [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=supabase-${proj}")" ]; then
             started+=("$proj")
         fi
@@ -1206,23 +1321,23 @@ cmd_reconcile() {
     fi
 
     export_main_stack_images || exit 1
-    for proj in "${started[@]}"; do
-        _ensure_disk_state "$proj"
-    done
-    cmd_rebuild_kong
-    for proj in "${started[@]}"; do
-        _start_project "$proj"
-    done
+    _start_projects "${started[@]}"
 }
 
 # The agent starts before the main-stack services reconcile copies images
-# from. Wait for them before taking the state lock, so a slow main-stack start
+# from. Wait for them, and for Postgres to accept connections (every project
+# start runs SQL), before taking the state lock, so a slow main-stack start
 # doesn't block other commands (e.g. kong-sb2-init's rebuild-kong).
+#
+# The image probe runs in a subshell: export_main_stack_images exports what it
+# finds even when it fails, and an export would count as an explicit override
+# on the next attempt, pinning an image the redeploy is about to replace.
 _wait_for_main_stack() {
     local waited=0 timeout="${SB2_RECONCILE_WAIT:-600}"
-    until export_main_stack_images 2>/dev/null; do
+    until ( export_main_stack_images ) 2>/dev/null \
+            && docker exec "$(db_container)" pg_isready -U postgres -h localhost -q 2>/dev/null; do
         if [ "$waited" -ge "$timeout" ]; then
-            export_main_stack_images || true
+            ( export_main_stack_images ) || true
             echo "Error: main stack not ready after ${timeout}s; per-project containers were not reconciled." >&2
             exit 1
         fi
@@ -1782,8 +1897,7 @@ cmd_rotate_keys() {
         echo "Skipping container restart (SB2_ROTATE_SKIP_RESTART=1)."
     elif docker ps --filter "name=supabase-${name}-" --format "{{.Names}}" | grep -q .; then
         echo "Restarting project containers..."
-        cmd_down "$name"
-        cmd_up "$name"
+        cmd_restart "$name"
     else
         echo "Project containers are not running — start them with: ./superbase2.sh up $name"
     fi
@@ -2352,10 +2466,11 @@ usage() {
     echo "  list                  List all projects"
     echo "  up [name]             Start project containers (all if no name)"
     echo "  down [name]           Stop project containers (all if no name)"
+    echo "  restart <name>        Stop and start a project's containers (checks the main stack first)"
     echo "  status [name]         Show container status"
     echo "  client-config <name>  Print client SDK configuration"
     echo "  rebuild-kong          Regenerate Kong config and reload"
-    echo "  reconcile             Recreate started projects' containers to match the main stack"
+    echo "  reconcile [name...]   Recreate started projects' containers to match the main stack"
     echo "  rotate-keys <name>    Rotate JWT secret + anon/service_role keys + database password (restarts containers)"
     echo "  migrate-db-owner <name>  Give a pre-existing project its own database role (one-time backfill)"
     echo "  verify [name]        Check container JWT secrets match manifest"
@@ -2363,7 +2478,7 @@ usage() {
 
 # State-changing commands run one at a time (see acquire_state_lock).
 case "${1:-}" in
-    setup|create|destroy|up|down|rebuild-kong|rotate-keys|migrate-db-owner)
+    setup|create|destroy|up|down|restart|rebuild-kong|rotate-keys|migrate-db-owner)
         acquire_state_lock
         ;;
 esac
@@ -2390,6 +2505,10 @@ case "${1:-}" in
     down)
         cmd_down "${2:-}"
         ;;
+    restart)
+        [ -z "${2:-}" ] && { echo "Error: project name required"; usage; exit 1; }
+        cmd_restart "$2"
+        ;;
     status)
         cmd_status "${2:-}"
         ;;
@@ -2403,7 +2522,7 @@ case "${1:-}" in
     reconcile)
         _wait_for_main_stack
         acquire_state_lock
-        cmd_reconcile
+        cmd_reconcile "${@:2}"
         ;;
     rotate-keys)
         [ -z "${2:-}" ] && { echo "Error: project name required"; usage; exit 1; }
