@@ -84,6 +84,10 @@ BEGIN;
   ALTER table "supabase_functions".hooks OWNER TO supabase_functions_admin;
   ALTER function "supabase_functions".http_request() OWNER TO supabase_functions_admin;
   GRANT supabase_functions_admin TO postgres;
+  -- http_request() is SECURITY DEFINER and runs as supabase_functions_admin. Serializing
+  -- NEW/OLD can touch objects in the extensions schema (PostGIS geometry reads
+  -- extensions.spatial_ref_sys), so the role needs USAGE on it.
+  GRANT USAGE ON SCHEMA extensions TO supabase_functions_admin;
   DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supabase_pg_net_admin') THEN
       REASSIGN OWNED BY supabase_pg_net_admin TO supabase_admin;

@@ -14,7 +14,7 @@ Run multiple database projects on a single Supabase deployment — one PostgreSQ
 > - Studio project switcher / `Cmd+K` / dashboard auth admin against the per-project GoTrue
 >
 > **What still needs work / is not exercised yet:**
-> - Realtime — boots and per-project tenant is seeded, but subscriptions haven't been smoke-tested end-to-end
+> - Realtime — Postgres Changes verified end-to-end on two concurrent projects (own DB role, own tenant, own replication slots); Broadcast/Presence and private channels with RLS have not been re-tested in this repo
 > - Storage — per-project containers come up and Kong routes resolve, but uploads/downloads/imgproxy paths are unverified
 > - Edge Functions, Analytics/Logflare, Supavisor pooler — wired up but not validated under real load
 > - Running more than a handful of projects on a single host
@@ -130,9 +130,13 @@ Coolify expects a single compose file — it does not support the multi-file `-f
    ```bash
    cd docker && sh utils/generate-keys.sh --coolify
    ```
-   Copy the entire output and paste it in one go — Coolify reads `KEY=value` lines and ignores `#` comment lines. All secrets are freshly generated. You only need to fill in two things manually:
-   - `SUPABASE_PUBLIC_URL` — your Kong domain (set this after step 7, then save).
+   Copy the entire output and paste it in one go — Coolify reads `KEY=value` lines and ignores `#` comment lines. All secrets are freshly generated. Fill in manually:
+   - `SUPABASE_PUBLIC_URL` — your Kong domain (set this after step 7, then save). Open Studio through exactly this URL: Studio rejects writes from any other origin with a 403 "CSRF" error.
+   - `SITE_URL` — your application's URL. Auth emails and OAuth redirect here, for every project.
    - `DASHBOARD_PASSWORD` — change to a strong password.
+   - SMTP (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_ADMIN_EMAIL`) — the stack has no mail server, so email signup and auth emails fail until this is set (or set `ENABLE_EMAIL_AUTOCONFIRM=true`).
+
+   Don't change `POSTGRES_PASSWORD` after the first deploy: Postgres only applies it when the data directory is created, so a later change locks every service out. Keep it hex (as generated) — it is embedded in connection URLs and SQL.
 
    Two optional SuperBase² toggles:
 
@@ -161,27 +165,31 @@ Coolify expects a single compose file — it does not support the multi-file `-f
 
 10. Deploy — Coolify pulls the pre-built Studio image from ghcr.io (fast, no build step).
 
+11. (Optional) **Redeploy from CI.** `.github/workflows/build-studio-image.yml` builds the Studio image on pushes to `master` and `development` and can redeploy Coolify afterwards. Add GitHub secrets `COOLIFY_WEBHOOK` (master's app) and/or `COOLIFY_WEBHOOK_DEVELOPMENT` (a separate test app), plus `COOLIFY_TOKEN` (a Coolify API token with deploy and write access). Also create a `STUDIO_IMAGE_TAG` variable on each Coolify app: the workflow sets it to the commit SHA it just built before redeploying, so Studio always matches the compose file and agent deployed next to it.
+
 ### What happens on first boot
 
 Coolify cannot bind-mount individual files from the git repo (Docker creates directories where files are expected), so `docker-compose.coolify.yml` ships with a set of one-shot **init containers** that materialize config and SQL into named volumes before the real services start. They all use `restart: "no"` and run to completion in dependency order:
 
 | Init container | Image | Purpose |
 |---|---|---|
-| `db-init` | alpine:3.19 | Writes all Postgres migrations and init scripts (`97-_supabase.sql`, `99-realtime.sql`, `99-logs.sql`, `99-pooler.sql`, `98-webhooks.sql`, `99-roles.sql`, `99-jwt.sql`) into the `db-init-migrations` and `db-init-initscripts` volumes. The `db` service mounts these as `/docker-entrypoint-initdb.d/*`. |
+| `db-init` | sb2-agent | Copies all Postgres migrations and init scripts (`97-_supabase.sql`, `99-realtime.sql`, `99-logs.sql`, `99-pooler.sql`, `98-webhooks.sql`, `99-roles.sql`, `99-jwt.sql`), baked into the sb2-agent image, into the `db-init-migrations` and `db-init-initscripts` volumes. The `db` service mounts these as `/docker-entrypoint-initdb.d/*`. |
 | `db-setup` | postgres client | Runs after `db` is healthy. Ensures the `_supabase` database and required schemas exist on subsequent boots (Postgres's `docker-entrypoint-initdb.d` only runs on first init when PGDATA is empty, so this fills the gap for restarts). |
-| `kong-init` | alpine:3.19 | Decodes the base64-embedded `kong.yml` and entrypoint into the `kong-config` volume. Kong then reads its declarative config from the volume instead of a bind-mount. |
-| `vector-pooler-init` | busybox:1.37 | Writes Vector and Supavisor pooler config files into the `vector-config` volume. |
-| `functions-init` | alpine:3.19 | Creates a default `main/index.ts` in the edge-functions volume if one doesn't already exist, so the `functions` service has something to serve on a clean install. |
+| `kong-init` | sb2-agent | Copies the base `kong.yml` (as `temp.yml`) and entrypoint from the image into the `kong-config` volume. Kong then reads its declarative config from the volume instead of a bind-mount. |
+| `vector-pooler-init` | sb2-agent | Copies the Vector and Supavisor pooler config files into the `vector-config` and `pooler-config` volumes. |
+| `functions-init` | sb2-agent | Creates a default `main/index.ts` in the edge-functions volume if one doesn't already exist, so the `functions` service has something to serve on a clean install. |
 | `superbase2-init` | alpine:3.19 | Creates the `projects.json` manifest file that the SB2 middleware reads, and verifies `ANON_KEY` / `SERVICE_ROLE_KEY` against `JWT_SECRET` (HMAC check) — fails fast with a remediation message if keys drifted from the live secret instead of letting Studio crash later with `bad_jwt` 403s. `studio` depends on this completing successfully. |
 | `kong-sb2-init` | sb2-agent | Waits for Kong readiness, then re-runs `rebuild-kong` so that per-project routes (`/project/<ref>/*`) are restored on every Coolify redeploy. Without this, redeploys would ship a base-only Kong config and break auth/rest/realtime/storage for all existing projects. |
-| `sb2-agent` | sb2-agent | Long-running sidecar (not an init container). Owns the Docker socket and exposes the project lifecycle API consumed by the `/sb2` UI. Periodically checks Kong routes and rebuilds them if missing. |
+| `sb2-agent` | sb2-agent | Long-running sidecar (not an init container). Owns the Docker socket and exposes the project lifecycle API consumed by the `/sb2` UI. On startup it runs `superbase2.sh reconcile`, which recreates every started project's containers against the freshly deployed main stack (same images, current env). Every 5 minutes it re-runs that if a project's images drifted from the main stack, and otherwise rebuilds Kong if any project's routes are missing. |
 
 If a deployment hangs, check these containers' logs first — a failed init container will block its dependents via `condition: service_completed_successfully`.
 
 Once running, verify the deployment:
 - Open your Kong domain — a browser basic-auth popup should appear. Credentials: username `supabase`, password is your `DASHBOARD_PASSWORD` env var. After auth, Kong proxies `/` to Studio.
 
-Open `/sb2` in your browser to create and manage projects. The `sb2-agent` sidecar handles the container lifecycle — Create, Start, Stop, Restart, and Rotate Keys are all driven from the UI without SSH. SSH is still useful for `superbase2.sh` advanced commands (`destroy`, `verify`, `status`, `client-config`).
+Open `/sb2` in your browser to create and manage projects. The `sb2-agent` sidecar handles the container lifecycle — Create, Start, Stop, Restart, Rotate Keys and Delete are all driven from the UI without SSH. SSH is still useful for `superbase2.sh` advanced commands (`verify`, `status`, `client-config`, `reconcile`).
+
+**Per-project containers live outside Coolify.** The agent starts each project's containers as a separate Compose project (`supabase-<name>`) over the Docker socket, so Coolify doesn't see them: stopping the app in Coolify leaves them running (they reconnect once the stack is back), and redeploying doesn't touch them — the agent's startup `reconcile` brings them in line with the new deploy instead. Stop a project in `/sb2` before stopping the stack if you want it down.
 
 **Upgrading on Coolify:** When Supabase releases updates, merge upstream into your fork and push to master — Coolify will pick up the new `docker-compose.coolify.yml` on its next deploy.
 
@@ -201,11 +209,11 @@ Then in Coolify: **Deploy** → Coolify pulls the updated compose file and the l
 
 **Why base directory is `/docker` and not `/docker/superbase2`:** Coolify reads `.env.example` from the base directory to populate its env var GUI. By pointing at `/docker`, Coolify reads Supabase's upstream `.env.example` directly — so when Supabase adds new variables, they automatically appear in your Coolify GUI without any SuperBase² changes.
 
-**How the lifecycle works:** Starting Docker containers requires Docker socket access, which the Studio web app deliberately doesn't have. Instead, the `sb2-agent` sidecar owns the socket and exposes a small internal HTTP API (`/projects/:name/up`, `/down`, `/restart`, `/rotate-keys`, `/rebuild-kong`, `/verify`) that Studio's middleware calls. The agent runs on the same Docker network and is not exposed publicly. SSH stays available as a fallback through `superbase2.sh`, but isn't required for routine use.
+**How the lifecycle works:** Starting Docker containers requires Docker socket access, which the Studio web app deliberately doesn't have. Instead, the `sb2-agent` sidecar owns the socket and exposes a small internal HTTP API (`/projects/:name/up`, `/down`, `/restart`, `/rotate-keys`, `/destroy`, `/rebuild-kong`, `/verify`, `/images`) that Studio's middleware calls. The agent runs on the same Docker network and is not exposed publicly. SSH stays available as a fallback through `superbase2.sh`, but isn't required for routine use. State-changing `superbase2.sh` commands take a lock, so the agent, `kong-sb2-init` and SSH runs never interleave.
 
 ### Fully removing a SuperBase² deployment (Coolify)
 
-Deleting the app in the Coolify UI removes containers and the application directory (`/data/coolify/applications/<app-id>/`), but **leaves named Docker volumes behind**. Those volumes hold state that you must wipe explicitly if you want a clean re-deploy, or if the deployment was ever exposed without auth and you're sure nothing valuable is in them:
+Deleting the app in the Coolify UI removes containers and the application directory (`/data/coolify/applications/<app-id>/`), but **leaves named Docker volumes behind** — and it doesn't know about per-project containers and volumes at all. Those hold state that you must wipe explicitly if you want a clean re-deploy, or if the deployment was ever exposed without auth and you're sure nothing valuable is in them:
 
 ```bash
 # Replace with your app's Coolify ID (shown in the UI URL or as the prefix
@@ -229,13 +237,18 @@ docker volume rm \
   ${APP_ID}_superbase2-config \
   ${APP_ID}_vector-config
 
-# 3. If the application directory still exists (e.g. you only stopped the
+# 3. Remove every project's containers and volumes (started by sb2-agent,
+#    outside Coolify). Per-project compose projects are named supabase-<name>.
+docker ps -aq --filter label=io.superbase2.managed=true | xargs -r docker rm -f
+docker volume ls -q --filter label=com.docker.compose.project | grep -E '^supabase-[a-z0-9]+_(storage|functions)-' | xargs -r docker volume rm
+
+# 4. If the application directory still exists (e.g. you only stopped the
 #    app without deleting), remove the PGDATA bind-mount and stale init
 #    SQL directories manually:
 rm -rf /data/coolify/applications/${APP_ID}/volumes/db/data
 rm -rf /data/coolify/applications/${APP_ID}/volumes/db/*.sql
 
-# 4. Verify — no volumes and no app dir should match:
+# 5. Verify — no volumes and no app dir should match:
 docker volume ls | grep ${APP_ID}
 ls /data/coolify/applications/ | grep ${APP_ID}
 ```
@@ -250,7 +263,11 @@ Partial resets (keep the app, wipe only the database): stop the app in the UI, t
 | 504 Gateway Timeout (but containers are healthy) | Traefik picking wrong Docker network IP | Enable "Connect To Predefined Network" in Advanced settings |
 | Too many redirects | Cloudflare SSL mode conflict with Force HTTPS | Set Cloudflare SSL to Full; if that doesn't work, temporarily set to Flexible to regain access |
 | Browser "not secure" warning | No HTTPS router generated | Ensure domain has `https://` prefix in Coolify; verify with `docker inspect <kong-container> --format '{{json .Config.Labels}}'` and look for `entryPoints = https` |
-| Kong crash-looping (`error parsing declarative config`) | Corrupt or empty `kong.yml` | Check `kong-init` container logs; verify the base64 blob decodes correctly |
+| Kong crash-looping (`error parsing declarative config`) | Corrupt or empty `kong.yml` | Check the `kong-init` and `kong-sb2-init` container logs, then run `rebuild-kong` via the agent or `superbase2.sh rebuild-kong` |
+| Saving anything in Studio fails with 403 "CSRF token missing/mismatch" | Studio opened through a URL other than `SUPABASE_PUBLIC_URL` | Set `SUPABASE_PUBLIC_URL` to the exact origin you browse to (scheme + host, no `:8000`) and redeploy |
+| Signup / magic link / invite emails never arrive | No SMTP configured (the default `supabase-mail` host doesn't exist) | Set the `SMTP_*` variables, or `ENABLE_EMAIL_AUTOCONFIRM=true` |
+| Every service fails to connect to Postgres after a redeploy | `POSTGRES_PASSWORD` changed after the first deploy | Restore the original value |
+| Projects keep old images/env after a redeploy, agent log says `main stack not ready` | `reconcile` timed out waiting for the main stack's services | Fix the failing main-stack service, then restart `sb2-agent` |
 
 ---
 
@@ -368,9 +385,9 @@ a credential that authenticates but owns nothing.
 
 ## Checking for updates
 
-The `/sb2` dashboard automatically checks Docker Hub for newer image tags. When updates are available, it shows an amber banner with the outdated services and upgrade commands.
+The `/sb2` dashboard compares the images the main stack is running (read by `sb2-agent` from Docker) with the versions upstream Supabase pins in its self-hosting compose files (`docker/docker-compose*.yml` on `supabase/supabase` master). Upstream's pins are versions tested together; only same-major-version bumps are offered, so it never suggests e.g. a Postgres major upgrade. When updates are available, it shows an amber banner with the outdated services.
 
-The banner shows shell commands built from `SUPERBASE2_COMPOSE_CMD`, **except on Coolify**, where it shows "Redeploy the application in Coolify" instead. Coolify regenerates the compose file on every deploy and keeps it outside the container, so a hand-run `docker compose up -d` is undone by the next redeploy.
+Off Coolify, the banner shows shell commands built from `SUPERBASE2_COMPOSE_CMD`. On Coolify the versions are pinned in `docker-compose.coolify.yml`, so redeploying alone re-pulls the same images: the banner tells you to update the tags there, push and redeploy. Running projects switch to the new images automatically — the agent's `reconcile` recreates them once the main stack is up.
 
 That branch is keyed on `COOLIFY_RESOURCE_UUID`, which Coolify injects into every container it manages (alongside `COOLIFY_CONTAINER_NAME`, `COOLIFY_FQDN`, `COOLIFY_URL`, `COOLIFY_BRANCH`). Nothing sets it in the standalone install. If Coolify ever renames that variable, the upgrade banner falls back to shell commands — wrong advice, but not a broken deployment. Set it manually to force the Coolify wording on a non-Coolify host.
 
@@ -407,8 +424,12 @@ The existing Studio UI components — project switcher, command palette, project
 
 ## Known limitations
 
-- **Realtime / Storage / Edge Functions / Analytics are not exercised yet.** Containers boot and Kong routes resolve, but real subscriptions, file uploads, function invocations, and log queries haven't been smoke-tested end-to-end. Expect rough edges and please open issues.
-- **Kong API keys are per-project.** Each project gets its own consumers and API key credentials in Kong, generated during `rebuild-kong`. Projects are isolated at both the Kong routing layer (API key validation) and the JWT level (per-service JWT secrets).
+- **Storage / Edge Functions / Analytics are not exercised yet.** Containers boot and Kong routes resolve, but file uploads, function invocations, and log queries haven't been smoke-tested end-to-end. Expect rough edges and please open issues.
+- **Realtime runs as its own database role (PostgreSQL 16+).** Each project's Realtime connects as `<db>_rt` (non-superuser, `REPLICATION`), created and repaired by `superbase2.sh` on every `up`. On PostgreSQL 15 — the pin in `docker/superbase2/docker-compose.standalone.yml` — that grant syntax does not exist, so Realtime falls back to `supabase_admin` (a superuser) and `up` prints a warning; use the Coolify compose or a PG17 image for the least-privilege role. The role can still log in to the main `postgres` database (PUBLIC holds CONNECT there) and `SET ROLE service_role`, so a compromised Realtime container can read main-stack data that `service_role` can, but it no longer holds superuser. An inactive logical replication slot retains WAL: a project stopped for a long time keeps its slots until it is started or destroyed, so watch disk if you leave projects stopped.
+- **Postgres sizing.** Every project opens its own connection pools (PostgREST, GoTrue, Storage, postgres-meta, Realtime, Functions) straight to the one shared cluster, and each running project's Realtime holds up to two replication slots. The Coolify compose therefore raises `max_connections` (default 300), `max_replication_slots` and `max_wal_senders` (default 40 each; the image default is 100/5/10, which runs out at about two or three projects). Override with `POSTGRES_MAX_CONNECTIONS`, `POSTGRES_MAX_REPLICATION_SLOTS`, `POSTGRES_MAX_WAL_SENDERS`. These need a database restart to apply. Memory per project is in the diagram above (idle estimates, plus an imgproxy container); size the host for the number of *running* projects.
+- **Kong API keys are per-project.** Each project gets its own consumers, API key credentials and ACL groups (`anon-<name>`, `admin-<name>`) in Kong, generated during `rebuild-kong`, so a project's keys only open that project's routes — never another project's, and never the main stack's (including its `/pg/` pg-meta route). Projects are also isolated at the JWT level (per-service JWT secrets).
+- **Logs are main-stack only.** Vector collects the main stack's containers; per-project service logs are only available through `docker logs supabase-<name>-<service>`. Studio's log explorer has no per-project scoping, so routing project logs into it would mix every project's logs together.
+- **One `SITE_URL` for all projects.** Every project's GoTrue uses the stack-wide `SITE_URL` and `ADDITIONAL_REDIRECT_URLS`.
 - **Untested at scale.** This has been tested with a handful of projects. Running 50+ projects on one instance is uncharted territory.
 - **Project roles can still reach the main `postgres` database.** `PUBLIC` holds `CONNECT` there, so a project role can open it, though it can read nothing inside. Revoking that would mean auditing every main-stack service.
 - **Database passwords are generated, not chosen.** `rotate-keys` mints a new random password; there is no way to set a specific one.

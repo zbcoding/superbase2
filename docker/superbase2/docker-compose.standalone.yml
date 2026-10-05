@@ -194,7 +194,6 @@ services:
       DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-supabase}
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
       SUPERBASE2_MANIFEST: /etc/superbase2/projects.json
-      SUPERBASE2_COMPOSE_FILE: /etc/superbase2/docker-compose.yml
       SUPERBASE2_COMPOSE_CMD: "docker compose -f superbase2/docker-compose.standalone.yml"
       # The upgrade banner prints SUPERBASE2_COMPOSE_CMD as shell commands unless
       # COOLIFY_RESOURCE_UUID is set, in which case it says "redeploy in Coolify"
@@ -208,7 +207,6 @@ services:
       - ../volumes/snippets:/app/snippets:Z
       - ../volumes/functions:/app/edge-functions:Z
       - superbase2-state:/etc/superbase2
-      - ./docker-compose.standalone.yml:/etc/superbase2/docker-compose.yml:ro,z
 
   # ─── Kong (API Gateway) ───────────────────────────────────────────────────
 

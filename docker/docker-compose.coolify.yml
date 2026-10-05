@@ -106,7 +106,6 @@ services:
       # "You do not have access to this project" after basic-HTTP login).
       NEXT_PUBLIC_SUPERBASE2_ENABLED: ${SUPERBASE2_ENABLED:-true}
       SUPERBASE2_MANIFEST: /etc/superbase2/projects.json
-      SUPERBASE2_COMPOSE_FILE: /etc/superbase2/docker-compose.yml
       SUPERBASE2_COMPOSE_CMD: "docker compose -f docker-compose.coolify.yml"
       # ── SuperBase² Agent (enables UI-driven project lifecycle controls) ──
       SB2_AGENT_URL: ${SB2_AGENT_URL:-http://sb2-agent:8088}
@@ -117,11 +116,6 @@ services:
       - functions-data:/app/edge-functions:Z
       # ── SuperBase² ──
       - superbase2-config:/etc/superbase2:z
-      # Bind-mount the Coolify working-copy compose so the upgrade endpoint
-      # can read current image tags at runtime. Coolify saves its processed
-      # compose as docker-compose.yaml in the application directory, so this
-      # mount is always the live deployed file.
-      - ./docker-compose.yaml:/etc/superbase2/docker-compose.yml:ro,z
 
   # ────────────────────────────────────────────────────────────────────────────
   # SuperBase² Agent — host-Docker broker for UI-driven project lifecycle.
@@ -927,6 +921,12 @@ services:
         "-c",
         "config_file=/etc/postgresql/postgresql.conf",
         "-c",
+        "max_connections=${POSTGRES_MAX_CONNECTIONS:-300}", # each project opens its own pools to this cluster; the image default of 100 runs out at a handful of projects
+        "-c",
+        "max_replication_slots=${POSTGRES_MAX_REPLICATION_SLOTS:-40}", # each running project's Realtime holds up to 2 (image default: 5)
+        "-c",
+        "max_wal_senders=${POSTGRES_MAX_WAL_SENDERS:-40}", # must cover the slots in use
+        "-c",
         "log_min_messages=fatal" # prevents Realtime polling queries from appearing in logs
       ]
 
@@ -967,7 +967,7 @@ services:
         condition: service_completed_successfully
     volumes:
       - vector-config:/etc/vector:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro,z
+      - ${DOCKER_SOCKET_LOCATION:-/var/run/docker.sock}:/var/run/docker.sock:ro,z
     healthcheck:
       test:
         [

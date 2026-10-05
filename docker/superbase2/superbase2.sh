@@ -55,56 +55,158 @@ fi
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
-# Resolve the shared Postgres container name. On a stock standalone install
-# this is the literal `supabase-db`, but Coolify names compose services
-# `<service>-<app-uuid>-<deploy-id>` (e.g. `db-nwcirqsw…-052516224648`).
-# We discover it from the `com.docker.compose.service=db` label so the script
-# works in both layouts. Result is cached for the life of the process.
+# Resolve a main-stack container by its compose service name. On a stock
+# standalone install the names are literal (`supabase-db`, `supabase-kong`),
+# but Coolify names compose services `<service>-<app-uuid>-<deploy-id>`
+# (e.g. `db-nwcirqsw…-052516224648`). We discover them from the
+# `com.docker.compose.service` label so the script works in both layouts.
 #
-# Override with SB2_DB_CONTAINER if you have a non-standard naming scheme.
-_DB_CONTAINER_CACHE=""
-db_container() {
-    if [ -n "$_DB_CONTAINER_CACHE" ]; then
-        echo "$_DB_CONTAINER_CACHE"
-        return
-    fi
-    if [ -n "${SB2_DB_CONTAINER:-}" ]; then
-        _DB_CONTAINER_CACHE="$SB2_DB_CONTAINER"
-        echo "$_DB_CONTAINER_CACHE"
-        return
-    fi
-    # When invoked from inside the sb2-agent container we can read our own
-    # compose project label from /etc/hostname → docker inspect, then scope
-    # the lookup so we never match a `db` service belonging to a different
-    # stack on the same host. On a host-side run /etc/hostname is the host's
-    # hostname (not a container id) and the inspect fails harmlessly,
-    # leaving us with the broader unscoped lookup.
-    local own_project=""
-    if [ -r /etc/hostname ]; then
-        local own_id
-        own_id=$(tr -d '[:space:]' < /etc/hostname 2>/dev/null || true)
-        if [ -n "$own_id" ]; then
-            own_project=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$own_id" 2>/dev/null || true)
-        fi
-    fi
+# Override the database container with SB2_DB_CONTAINER if you have a
+# non-standard naming scheme.
 
-    local found=""
+# When invoked from inside an sb2 container (agent, kong-sb2-init) we read our
+# own compose project label from /etc/hostname → docker inspect, so lookups are
+# scoped to this stack and never match a same-named service belonging to
+# another stack on the host. On a host-side run /etc/hostname is the host's
+# hostname (not a container id) and the inspect fails harmlessly.
+own_compose_project() {
+    local own_id=""
+    [ -r /etc/hostname ] && own_id=$(tr -d '[:space:]' < /etc/hostname 2>/dev/null || true)
+    [ -n "$own_id" ] || return 0
+    docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$own_id" 2>/dev/null || true
+}
+
+# Print the running container for a main-stack service, or nothing.
+# $1 = compose service name, $2 = literal name used by the standalone layout.
+service_container() {
+    local service="$1"
+    local literal="${2:-}"
+
+    local own_project found=""
+    own_project=$(own_compose_project)
     if [ -n "$own_project" ]; then
         found=$(docker ps \
-            --filter "label=com.docker.compose.service=db" \
+            --filter "label=com.docker.compose.service=$service" \
             --filter "label=com.docker.compose.project=$own_project" \
             --format '{{.Names}}' 2>/dev/null | head -n 1)
-    fi
-    if [ -z "$found" ]; then
-        found=$(docker ps --filter "label=com.docker.compose.service=db" \
+    elif [ -n "$literal" ] && docker inspect "$literal" &>/dev/null; then
+        # Host-side run: prefer the standalone layout's literal name over an
+        # unscoped label match, which could pick another stack's container.
+        found="$literal"
+    else
+        found=$(docker ps --filter "label=com.docker.compose.service=$service" \
                           --format '{{.Names}}' 2>/dev/null | head -n 1)
     fi
-    if [ -z "$found" ]; then
-        # Fallback: literal name used by the standalone (non-Coolify) layout.
-        found="supabase-db"
+    echo "$found"
+}
+
+db_container() {
+    if [ -n "${SB2_DB_CONTAINER:-}" ]; then
+        echo "$SB2_DB_CONTAINER"
+        return
     fi
-    _DB_CONTAINER_CACHE="$found"
-    echo "$_DB_CONTAINER_CACHE"
+    local found
+    found=$(service_container db supabase-db)
+    # Fallback: literal name used by the standalone (non-Coolify) layout.
+    echo "${found:-supabase-db}"
+}
+
+# Serialize every state-changing command (create, destroy, up, down,
+# rotate-keys, rebuild-kong, ...) across processes and containers: the agent,
+# the kong-sb2-init one-shot and host-side CLI runs all share STATE_DIR.
+# Concurrent runs would otherwise interleave writes to kong.yml, the project
+# .env files and the compose files. flock releases automatically when the
+# process exits, so a crashed run can't leave a stale lock behind.
+acquire_state_lock() {
+    if ! command -v flock &>/dev/null; then
+        echo "Error: 'flock' is required but not installed (util-linux / busybox)." >&2
+        exit 1
+    fi
+    exec 9>"$STATE_DIR/.superbase2.lock"
+    # Poll with -n: BusyBox flock (sb2-agent image) has no -w timeout option.
+    local waited=0 timeout="${SB2_LOCK_TIMEOUT:-900}"
+    until flock -n 9; do
+        if [ "$waited" -eq 0 ]; then
+            echo "Waiting for another superbase2.sh command to finish..." >&2
+        fi
+        if [ "$waited" -ge "$timeout" ]; then
+            echo "Error: timed out waiting for another superbase2.sh command to finish." >&2
+            exit 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+# Lock for projects.json, shared with Studio (apps/studio/lib/superbase2/
+# projects.ts): the lock file is created with O_EXCL (noclobber) and holds
+# "<pid>:<epoch-ms>"; a lock older than 10 s is considered stale. Keep the
+# critical section well under that, or Studio will break the lock.
+MANIFEST_LOCK="$PROJECTS_MANIFEST.lock"
+MANIFEST_LOCK_STALE_MS=10000
+
+_now_ms() {
+    date +%s%3N
+}
+
+acquire_manifest_lock() {
+    local deadline=$(( $(_now_ms) + 15000 ))
+    while ! ( set -o noclobber; printf '%s:%s' "$$" "$(_now_ms)" > "$MANIFEST_LOCK" ) 2>/dev/null; do
+        local held_since
+        held_since=$(cut -d: -f2 "$MANIFEST_LOCK" 2>/dev/null || true)
+        if [[ "$held_since" =~ ^[0-9]+$ ]] && [ $(( $(_now_ms) - held_since )) -gt "$MANIFEST_LOCK_STALE_MS" ]; then
+            # Rename before deleting so two processes breaking the same stale
+            # lock can't delete a fresh one (same protocol as Studio).
+            mv "$MANIFEST_LOCK" "$MANIFEST_LOCK.stale.$$" 2>/dev/null && rm -f "$MANIFEST_LOCK.stale.$$"
+            continue
+        fi
+        if [ "$(_now_ms)" -gt "$deadline" ]; then
+            echo "Error: timed out waiting for the manifest lock ($MANIFEST_LOCK)." >&2
+            exit 1
+        fi
+        sleep 0.05
+    done
+}
+
+release_manifest_lock() {
+    rm -f "$MANIFEST_LOCK"
+}
+
+# Export the images the main stack is running for the services each project
+# also runs, so per-project containers always match the main stack instead of
+# the template's fallback pins. A Coolify redeploy that bumps an image then
+# reaches every project on its next `up` (the agent runs `reconcile` at start).
+#
+# Returns 1 (listing the missing services) if any main-stack service isn't
+# running: falling back to the template pins could downgrade a project whose
+# database a newer image already migrated on an earlier `up`.
+export_main_stack_images() {
+    local entry service literal var image ctr missing=""
+    for entry in auth:supabase-auth:GOTRUE_IMAGE \
+                 rest:supabase-rest:POSTGREST_IMAGE \
+                 realtime:realtime-dev.supabase-realtime:REALTIME_IMAGE \
+                 storage:supabase-storage:STORAGE_IMAGE \
+                 imgproxy:supabase-imgproxy:IMGPROXY_IMAGE \
+                 meta:supabase-meta:POSTGRES_META_IMAGE \
+                 functions:supabase-edge-functions:EDGE_RUNTIME_IMAGE; do
+        IFS=: read -r service literal var <<< "$entry"
+        # An explicit override (e.g. from the host .env) wins.
+        [ -n "${!var:-}" ] && continue
+        ctr=$(service_container "$service" "$literal")
+        image=""
+        [ -n "$ctr" ] && image=$(docker inspect -f '{{.Config.Image}}' "$ctr" 2>/dev/null || true)
+        if [ -n "$image" ]; then
+            export "$var=$image"
+        else
+            missing="$missing $service"
+        fi
+    done
+    if [ -n "$missing" ]; then
+        echo "Error: main-stack service(s) not running:$missing." >&2
+        echo "  Per-project containers use the same images as the main stack; start it first" >&2
+        echo "  (or set the matching *_IMAGE variables to override)." >&2
+        return 1
+    fi
 }
 
 gen_hex() {
@@ -166,9 +268,10 @@ get_disabled_services() {
 # whose names collide with service names (e.g. a `functions-vrsite:` named
 # volume), and stripping those would break the resulting compose file.
 #
-# A disabled service also takes its companion `<svc>-init-<name>` block with
-# it (the init seeder service references the disabled service's volume), so
-# we don't leave an orphan referencing an undeclared volume.
+# A disabled service also takes its companion blocks with it — the
+# `<svc>-init-<name>` seeder (it references the disabled service's volume) and,
+# for storage, `imgproxy-<name>` (it mounts the storage volume) — so we don't
+# leave an orphan referencing an undeclared volume.
 filter_disabled_services() {
     local compose_file="$1"
     local name="$2"
@@ -188,15 +291,18 @@ filter_disabled_services() {
         # The service key in the compose file is "<svc>-<name>:"
         local svc_key="${svc}-${name}"
         local init_key="${svc}-init-${name}"
+        local companion_key=""
+        [ "$svc" = "storage" ] && companion_key="imgproxy-${name}"
         awk \
             -v svc_line="  ${svc_key}:" \
-            -v init_line="  ${init_key}:" '
+            -v init_line="  ${init_key}:" \
+            -v companion_line="${companion_key:+  ${companion_key}:}" '
         BEGIN { skip=0; in_services=0 }
         # Enter / leave the services: section based on top-level keys.
         /^services:[[:space:]]*$/ { in_services=1; skip=0; print; next }
         /^[a-zA-Z_][a-zA-Z0-9_-]*:[[:space:]]*$/ { in_services=0; skip=0 }
         # Only strip blocks inside the services: section.
-        in_services && ($0 == svc_line || $0 == init_line) { skip=1; next }
+        in_services && ($0 == svc_line || $0 == init_line || (companion_line != "" && $0 == companion_line)) { skip=1; next }
         # Stop skipping at the next sibling service (2-space indent + alpha).
         skip && /^  [a-zA-Z]/ { skip=0 }
         # Or at the next top-level key.
@@ -214,12 +320,8 @@ filter_disabled_services() {
 sync_manifest() {
     # Merge disk-scanned projects with existing manifest entries.
     # Disk entries win on conflicts; manifest-only entries (e.g. API-created) are preserved.
-
-    # Load existing manifest entries keyed by project name using jq
-    local existing_json='{"projects":[]}'
-    if [ -f "$PROJECTS_MANIFEST" ] && [ -s "$PROJECTS_MANIFEST" ]; then
-        existing_json=$(jq '.' "$PROJECTS_MANIFEST" 2>/dev/null || echo '{"projects":[]}')
-    fi
+    # The disk scan runs before taking the manifest lock (it can take a while
+    # with many projects); only the read-merge-write of projects.json is locked.
 
     # Build array of disk-scanned projects
     local disk_json='[]'
@@ -272,6 +374,20 @@ sync_manifest() {
         disk_names_json=$(echo "$disk_names_json" | jq --arg n "$dname" '. + [$n]')
     done
 
+    acquire_manifest_lock
+    # Studio writes projects.json under the same lock, so reading it here and
+    # writing it back below can't drop an entry Studio added in between.
+    local existing_json='{"projects":[]}'
+    if [ -f "$PROJECTS_MANIFEST" ] && [ -s "$PROJECTS_MANIFEST" ]; then
+        # Fail instead of treating an unreadable manifest as empty: that would
+        # silently drop every API-created project that has no disk state yet.
+        if ! existing_json=$(jq '.' "$PROJECTS_MANIFEST"); then
+            release_manifest_lock
+            echo "Error: $PROJECTS_MANIFEST is not valid JSON; refusing to overwrite it." >&2
+            exit 1
+        fi
+    fi
+
     # Preserve manifest-only entries (API-created projects not yet on disk)
     local manifest_only
     manifest_only=$(echo "$existing_json" | jq --argjson names "$disk_names_json" \
@@ -284,10 +400,16 @@ sync_manifest() {
     disabled_map=$(echo "$existing_json" | jq \
         '[.projects[] | select(.disabled_services != null) | {key: .name, value: .disabled_services}] | from_entries')
 
-    # Merge: disk projects first, then manifest-only entries
+    # Merge: disk projects first, then manifest-only entries. Write to a temp
+    # file in the same directory and rename, so Studio never reads a partial file.
+    local manifest_tmp
+    manifest_tmp=$(mktemp "$PROJECTS_MANIFEST.XXXXXX")
     jq -n --argjson disk "$disk_json" --argjson manifest "$manifest_only" --argjson disabled "$disabled_map" \
         '{projects: (($disk | map(if $disabled[.name] then . + {disabled_services: $disabled[.name]} else . end)) + $manifest)}' \
-        > "$PROJECTS_MANIFEST"
+        > "$manifest_tmp"
+    chmod 600 "$manifest_tmp"
+    mv "$manifest_tmp" "$PROJECTS_MANIFEST"
+    release_manifest_lock
 }
 
 project_exists() {
@@ -507,6 +629,231 @@ ALTER ROLE "$role" SET search_path TO "\$user", public, extensions;
 EOSQL
 }
 
+# Set KEY=VALUE in a project .env (replace or append), atomically.
+_set_env_var() {
+    local env_file="$1" key="$2" value="$3"
+    local tmp_env
+    tmp_env=$(mktemp)
+    awk -v k="$key" -v v="$value" '
+        index($0, k "=") == 1 { print k "=" v; seen=1; next }
+        { print }
+        END { if (!seen) print k "=" v }
+    ' "$env_file" > "$tmp_env"
+    chmod 600 "$tmp_env"
+    mv "$tmp_env" "$env_file"
+}
+
+# Give Realtime its own database role instead of supabase_admin.
+#
+# Realtime connects with DB_USER and creates its own schemas, tables,
+# publications and replication slots there. As supabase_admin (superuser) a
+# compromised Realtime container owned the whole cluster; this role is
+# NOSUPERUSER and cannot connect to any other project's database.
+#
+# Idempotent, and run on every start (_start_project): it also repairs
+# projects created before this role existed, whose _realtime/realtime schemas
+# are owned by postgres/supabase_admin and whose `realtime` schema was never
+# created at all. Writes PROJECT_REALTIME_DB_USER, PROJECT_REALTIME_DB_PASSWORD
+# and PROJECT_REALTIME_SLOT_SUFFIX into the project .env for the compose file.
+#
+# The role needs PostgreSQL 16+ (GRANT ... WITH INHERIT FALSE); older servers
+# fall back to supabase_admin with a warning. Keep the role name in
+# sync with dropProjectDatabase() in apps/studio/lib/superbase2/db.ts.
+_ensure_realtime_db() {
+    local name="$1"
+    local env_file="$PROJECTS_DIR/$name/.env"
+    local db rt_user rt_password slot_suffix
+
+    db=$(grep "^PROJECT_DB=" "$env_file" | cut -d= -f2-)
+    if [ -z "$db" ]; then
+        echo "Error: PROJECT_DB missing from $env_file"
+        exit 1
+    fi
+    # '_rt' keeps the name <= 59 chars; Postgres silently truncates at 63.
+    rt_user="${db}_rt"
+
+    rt_password=$(grep "^PROJECT_REALTIME_DB_PASSWORD=" "$env_file" | cut -d= -f2- || true)
+    if ! [[ "$rt_password" =~ ^[a-f0-9]{32,128}$ ]]; then
+        rt_password=$(gen_hex 24)
+    fi
+
+    # Replication slot names are cluster-global and Realtime's defaults are not
+    # per-project, so two running projects fight over one slot. Names allow
+    # [a-z0-9_] and a 19-char suffix (44-char prefix, 63-char limit).
+    slot_suffix=$(printf '%s' "$db" | md5sum | cut -c1-16)
+
+    local db_ctr version
+    db_ctr=$(db_container)
+    version=$(docker exec "$db_ctr" psql -U supabase_admin -d postgres -tAc "SHOW server_version_num;")
+    if [ "${version:-0}" -lt 160000 ]; then
+        # GRANT ... WITH INHERIT FALSE (what keeps the role out of every other
+        # project's database) does not exist before PostgreSQL 16. Rather than
+        # leave those installs unable to start a project, keep the previous
+        # behaviour (Realtime as supabase_admin) and say so.
+        echo "WARNING: PostgreSQL server_version_num=$version (< 160000): Realtime for '$name' will run as the supabase_admin superuser."
+        echo "         Upgrade to PostgreSQL 16+ for a least-privilege Realtime role."
+        docker exec -i "$db_ctr" psql -U supabase_admin -d "$db" -v ON_ERROR_STOP=1 <<'EOSQL'
+CREATE SCHEMA IF NOT EXISTS _realtime;
+CREATE SCHEMA IF NOT EXISTS realtime;
+EOSQL
+        local super_password
+        super_password=$(grep "^POSTGRES_PASSWORD=" "$env_file" | cut -d= -f2-)
+        _set_env_var "$env_file" PROJECT_REALTIME_DB_USER supabase_admin
+        _set_env_var "$env_file" PROJECT_REALTIME_DB_PASSWORD "$super_password"
+        _set_env_var "$env_file" PROJECT_REALTIME_SLOT_SUFFIX "$slot_suffix"
+        return 0
+    fi
+
+    # Quoted heredoc: no shell expansion, so no escaping of $ or backticks.
+    # Values arrive as psql variables. supabase_admin, not postgres:
+    # supabase_realtime_admin is a supautils-reserved role that only a
+    # superuser may create or grant.
+    docker exec -i "$db_ctr" psql -U supabase_admin -d postgres -v ON_ERROR_STOP=1 \
+        -v db="$db" -v rt="$rt_user" -v pw="$rt_password" <<'EOSQL'
+SELECT format(
+  CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'rt')
+       THEN 'ALTER ROLE %1$I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS REPLICATION INHERIT PASSWORD %2$L'
+       ELSE 'CREATE ROLE %1$I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS REPLICATION INHERIT PASSWORD %2$L'
+  END, :'rt', :'pw') \gexec
+-- Realtime does set_config('role', <jwt role>) for RLS checks, so it needs SET
+-- on these. INHERIT FALSE is essential: anon/authenticated/service_role hold
+-- CONNECT on every project database, and inheriting them would open all of them.
+SELECT format('GRANT anon, authenticated, service_role TO %I WITH INHERIT FALSE, SET TRUE', :'rt') \gexec
+-- realtime.list_changes() is declared SET log_min_messages.
+SELECT format('GRANT SET ON PARAMETER log_min_messages TO %I', :'rt') \gexec
+SELECT 'CREATE ROLE supabase_realtime_admin WITH NOINHERIT NOLOGIN NOREPLICATION'
+ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supabase_realtime_admin') \gexec
+GRANT supabase_realtime_admin TO postgres;
+SELECT format('GRANT supabase_realtime_admin TO %I', :'rt') \gexec
+
+\c :db
+-- CONNECT to log in; CREATE because PG15+ needs it for CREATE PUBLICATION.
+SELECT format('GRANT CONNECT, CREATE ON DATABASE %I TO %I', :'db', :'rt') \gexec
+SELECT format('CREATE SCHEMA IF NOT EXISTS _realtime AUTHORIZATION %I', :'rt') \gexec
+SELECT format('ALTER SCHEMA _realtime OWNER TO %I', :'rt') \gexec
+-- Self-hosted Realtime does not create the tenant schema itself.
+SELECT format('CREATE SCHEMA IF NOT EXISTS realtime AUTHORIZATION %I', :'rt') \gexec
+SELECT format('ALTER SCHEMA realtime OWNER TO %I', :'rt') \gexec
+GRANT USAGE, CREATE ON SCHEMA realtime TO supabase_realtime_admin;
+-- Subscribing to Postgres Changes runs realtime.subscription_check_filters(),
+-- which casts every information_schema.columns row to regclass before the
+-- view's privilege filter is applied. Without USAGE on a schema that holds any
+-- table (auth, storage, or one the user creates later) that cast fails with
+-- "permission denied for schema" and no subscription works. Superusers skip
+-- the check, which is why this only shows up with a least-privilege role.
+-- USAGE alone grants no access to the objects inside.
+CREATE OR REPLACE FUNCTION extensions.sb2_realtime_grant_usage()
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path = pg_catalog
+AS $fn$
+DECLARE
+  rt text := current_database() || '_rt';
+  s record;
+BEGIN
+  FOR s IN
+    SELECT nspname FROM pg_namespace
+    WHERE nspname !~ '^pg_' AND nspname <> 'information_schema'
+      AND NOT has_schema_privilege(rt, oid, 'USAGE')
+  LOOP
+    EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I', s.nspname, rt);
+  END LOOP;
+END;
+$fn$;
+CREATE OR REPLACE FUNCTION extensions.sb2_realtime_schema_usage()
+ RETURNS event_trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path = pg_catalog
+AS $fn$
+BEGIN
+  PERFORM extensions.sb2_realtime_grant_usage();
+END;
+$fn$;
+-- Schemas created later: CREATE SCHEMA, and CREATE EXTENSION for extensions
+-- that bring their own (cron, pgmq, ...).
+DROP EVENT TRIGGER IF EXISTS sb2_realtime_schema_usage;
+CREATE EVENT TRIGGER sb2_realtime_schema_usage ON ddl_command_end
+  WHEN TAG IN ('CREATE SCHEMA', 'CREATE EXTENSION')
+  EXECUTE FUNCTION extensions.sb2_realtime_schema_usage();
+-- Schemas that exist now.
+SELECT extensions.sb2_realtime_grant_usage();
+-- Tenant migration 20240401105812 needs superuser for its role work, which is
+-- done above; mark it applied (the tables it re-owns are dropped by a later one).
+CREATE TABLE IF NOT EXISTS realtime.schema_migrations (version bigint PRIMARY KEY, inserted_at timestamp(0));
+SELECT format('ALTER TABLE realtime.schema_migrations OWNER TO %I', :'rt') \gexec
+INSERT INTO realtime.schema_migrations VALUES (20240401105812, now()) ON CONFLICT DO NOTHING;
+
+-- Existing projects: hand Realtime's objects (created while it ran as
+-- supabase_admin) to the new role. Objects Realtime itself gave to
+-- supabase_realtime_admin (realtime.messages, realtime.topic()) stay as they are.
+SELECT set_config('sb2.rt', :'rt', false);
+DO $$
+DECLARE
+  rt text := current_setting('sb2.rt');
+  r record;
+BEGIN
+  FOR r IN
+    SELECT c.oid::regclass AS obj, c.relkind
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname IN ('_realtime', 'realtime')
+      AND c.relkind IN ('r', 'p', 'S', 'v', 'm')
+      AND c.relowner <> 'supabase_realtime_admin'::regrole
+      AND c.relowner <> rt::regrole
+      -- identity/serial sequences follow their table
+      AND NOT (c.relkind = 'S' AND EXISTS (
+        SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype IN ('a', 'i')))
+  LOOP
+    EXECUTE format('ALTER %s %s OWNER TO %I',
+      CASE r.relkind WHEN 'S' THEN 'SEQUENCE' WHEN 'v' THEN 'VIEW'
+                     WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE 'TABLE' END,
+      r.obj, rt);
+  END LOOP;
+
+  FOR r IN
+    SELECT p.oid::regprocedure AS obj
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname IN ('_realtime', 'realtime')
+      AND p.proowner <> 'supabase_realtime_admin'::regrole
+      AND p.proowner <> rt::regrole
+  LOOP
+    EXECUTE format('ALTER ROUTINE %s OWNER TO %I', r.obj, rt);
+  END LOOP;
+
+  -- enum / composite / domain types (array types follow their element type)
+  FOR r IN
+    SELECT t.oid::regtype AS obj, t.typtype
+    FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+    WHERE n.nspname IN ('_realtime', 'realtime')
+      AND t.typelem = 0
+      AND (t.typrelid = 0 OR (SELECT relkind FROM pg_class WHERE oid = t.typrelid) = 'c')
+      AND t.typowner <> 'supabase_realtime_admin'::regrole
+      AND t.typowner <> rt::regrole
+  LOOP
+    EXECUTE format('ALTER %s %s OWNER TO %I',
+      CASE r.typtype WHEN 'd' THEN 'DOMAIN' ELSE 'TYPE' END, r.obj, rt);
+  END LOOP;
+
+  -- Realtime drops and recreates this publication when it looks stale.
+  FOR r IN SELECT pubname FROM pg_publication WHERE pubname LIKE 'supabase_realtime_messages%' LOOP
+    EXECUTE format('ALTER PUBLICATION %I OWNER TO %I', r.pubname, rt);
+  END LOOP;
+
+  -- Older sb2 versions ignored the tenant name and always seeded 'realtime-dev',
+  -- which nothing reads. Realtime now seeds realtime-<project> itself; drop the
+  -- stale one (its extensions rows cascade).
+  IF to_regclass('_realtime.tenants') IS NOT NULL THEN
+    DELETE FROM _realtime.tenants WHERE external_id = 'realtime-dev';
+  END IF;
+END $$;
+EOSQL
+
+    _set_env_var "$env_file" PROJECT_REALTIME_DB_USER "$rt_user"
+    _set_env_var "$env_file" PROJECT_REALTIME_DB_PASSWORD "$rt_password"
+    _set_env_var "$env_file" PROJECT_REALTIME_SLOT_SUFFIX "$slot_suffix"
+}
+
 _init_project_db() {
     local name="$1"
     local db_name="$2"
@@ -548,9 +895,8 @@ _init_project_db() {
 ALTER DATABASE "$db_name" SET "app.settings.jwt_secret" TO '$safe_jwt_secret';
 ALTER DATABASE "$db_name" SET "app.settings.jwt_exp" TO '$jwt_exp';
 
--- Create realtime schema
-CREATE SCHEMA IF NOT EXISTS _realtime;
-ALTER SCHEMA _realtime OWNER TO postgres;
+-- The _realtime and realtime schemas are created on every start by
+-- _ensure_realtime_db(), owned by Realtime's own role.
 
 -- Create storage schema (if needed by storage service)
 CREATE SCHEMA IF NOT EXISTS storage;
@@ -632,7 +978,7 @@ GRANT USAGE ON SCHEMA extensions TO "$db_name";
 GRANT USAGE ON SCHEMA graphql_public TO "$db_name";
 
 -- PostgREST schema-cache invalidation. The supabase/postgres image installs
--- these into the `postgres` database at cluster init only; a project database
+-- these into the "postgres" database at cluster init only; a project database
 -- created later inherits template1 and gets none of them, so PostgREST never
 -- reloads its schema cache until its container restarts. Definitions copied
 -- verbatim from the image's init migration.
@@ -705,21 +1051,30 @@ EOSQL
 
 cmd_destroy() {
     local name="$1"
+    local assume_yes="${2:-}"
 
     if ! project_exists "$name"; then
+        if [ "$assume_yes" = "--yes" ]; then
+            # Studio deletes projects that were created but never started; they
+            # have no disk state or containers, and Studio drops the database.
+            echo "Project '$name' has no disk state; nothing to remove."
+            return 0
+        fi
         echo "Error: Project '$name' does not exist."
         exit 1
     fi
 
-    echo "WARNING: This will destroy project '$name' including:"
-    echo "  - All project containers"
-    echo "  - The project database"
-    echo "  - All stored files"
-    echo ""
-    read -r -p "Type the project name to confirm: " confirm
-    if [ "$confirm" != "$name" ]; then
-        echo "Aborted."
-        exit 1
+    if [ "$assume_yes" != "--yes" ]; then
+        echo "WARNING: This will destroy project '$name' including:"
+        echo "  - All project containers"
+        echo "  - The project database"
+        echo "  - All stored files"
+        echo ""
+        read -r -p "Type the project name to confirm: " confirm
+        if [ "$confirm" != "$name" ]; then
+            echo "Aborted."
+            exit 1
+        fi
     fi
 
     local project_dir="$PROJECTS_DIR/$name"
@@ -747,6 +1102,18 @@ cmd_destroy() {
     # Roles are cluster-global, so the login role outlives the database.
     if ! docker exec "$(db_container)" psql -U supabase_admin -c "DROP ROLE IF EXISTS \"$PROJECT_DB\";" 2>&1; then
         echo "Warning: Failed to drop role '$PROJECT_DB'. It may need manual cleanup."
+    fi
+    # Realtime's role. The REVOKE is required: a role holding a parameter ACL
+    # cannot be dropped until it is revoked (pg_shdepend dependency).
+    # DROP DATABASE already removed its inactive replication slots.
+    local rt_role="${PROJECT_DB}_rt"
+    if docker exec "$(db_container)" psql -U supabase_admin -tAc \
+        "SELECT 1 FROM pg_roles WHERE rolname='${rt_role}'" | grep -q 1; then
+        if ! docker exec "$(db_container)" psql -U supabase_admin -v ON_ERROR_STOP=1 \
+            -c "REVOKE SET ON PARAMETER log_min_messages FROM \"${rt_role}\";" \
+            -c "DROP ROLE \"${rt_role}\";" 2>&1; then
+            echo "Warning: Failed to drop role '${rt_role}'. It may need manual cleanup."
+        fi
     fi
 
     # Remove project directory
@@ -795,6 +1162,8 @@ cmd_list() {
 cmd_up() {
     local name="${1:-}"
 
+    export_main_stack_images || exit 1
+
     if [ -z "$name" ]; then
         # Start all projects — generate any missing disk state first, then rebuild
         # Kong once and start all containers.
@@ -812,6 +1181,54 @@ cmd_up() {
     _ensure_disk_state "$name"
     cmd_rebuild_kong
     _start_project "$name"
+}
+
+# Bring per-project containers back in line with the main stack after it was
+# (re)deployed: the agent runs this on startup. Per-project stacks are separate
+# compose projects started over the Docker socket, so a Coolify redeploy never
+# touches them — without this they keep running the previous deploy's images
+# and environment until someone restarts each project by hand.
+#
+# Only projects that currently have containers (running or exited) are
+# recreated. `down` removes a project's containers, so a project the user
+# stopped stays stopped.
+cmd_reconcile() {
+    local started=()
+    for proj in $(list_projects); do
+        if [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=supabase-${proj}")" ]; then
+            started+=("$proj")
+        fi
+    done
+
+    if [ ${#started[@]} -eq 0 ]; then
+        echo "No started projects to reconcile."
+        return 0
+    fi
+
+    export_main_stack_images || exit 1
+    for proj in "${started[@]}"; do
+        _ensure_disk_state "$proj"
+    done
+    cmd_rebuild_kong
+    for proj in "${started[@]}"; do
+        _start_project "$proj"
+    done
+}
+
+# The agent starts before the main-stack services reconcile copies images
+# from. Wait for them before taking the state lock, so a slow main-stack start
+# doesn't block other commands (e.g. kong-sb2-init's rebuild-kong).
+_wait_for_main_stack() {
+    local waited=0 timeout="${SB2_RECONCILE_WAIT:-600}"
+    until export_main_stack_images 2>/dev/null; do
+        if [ "$waited" -ge "$timeout" ]; then
+            export_main_stack_images || true
+            echo "Error: main stack not ready after ${timeout}s; per-project containers were not reconciled." >&2
+            exit 1
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
 }
 
 # Ensure disk state exists for a project (generate from manifest if needed).
@@ -871,83 +1288,20 @@ _start_project() {
     local project_dir="$PROJECTS_DIR/$name"
 
     echo "Starting project: $name"
+
+    # Realtime's database role and schemas must exist before its container
+    # starts, and its credentials land in the .env compose reads below.
+    _ensure_realtime_db "$name"
+
+    # --remove-orphans: a service disabled since the last start (and its
+    # companions, e.g. imgproxy for storage) is gone from the regenerated
+    # compose file, so stop it instead of leaving it running.
     docker compose -f "$project_dir/docker-compose.yml" \
         --env-file "$project_dir/.env" \
         --project-name "supabase-${name}" \
-        up -d
-
-    # Fix realtime tenant: the realtime image seeds a tenant named "realtime-dev"
-    # regardless of SEED_SELF_HOST_EXTERNAL_ID. Rename it to match the expected
-    # "realtime-{name}" so the healthcheck passes.
-    _fix_realtime_tenant "$name"
+        up -d --remove-orphans
 
     echo "Project '$name' started."
-}
-
-# Rename the default "realtime-dev" tenant to "realtime-{name}" in the project DB.
-# The realtime container seeds "realtime-dev" on first start and ignores
-# SEED_SELF_HOST_EXTERNAL_ID, so we patch the tenant row after startup.
-# We can't wait for "healthy" because the healthcheck itself depends on the
-# tenant having the correct name, so we wait for the container to be running
-# and then poll for the tenant row to appear in _realtime.tenants.
-_fix_realtime_tenant() {
-    local name="$1"
-    local rt_ctr="realtime-${name}.supabase-realtime"
-    local db_ctr
-    db_ctr=$(db_container)
-
-    # Read project DB name from .env
-    local project_db
-    project_db=$(grep "^PROJECT_DB=" "$PROJECTS_DIR/$name/.env" 2>/dev/null | cut -d= -f2-)
-    [ -z "$project_db" ] && return 0
-
-    # If the realtime container doesn't exist (disabled service), skip silently
-    if ! docker inspect "$rt_ctr" --format '{{.Id}}' &>/dev/null; then
-        return 0
-    fi
-
-    # Wait for the realtime container to be running (max 30s)
-    local waited=0
-    while [ $waited -lt 30 ]; do
-        local running
-        running=$(docker inspect "$rt_ctr" --format '{{.State.Running}}' 2>/dev/null || echo "false")
-        if [ "$running" = "true" ]; then
-            break
-        fi
-        sleep 2
-        waited=$((waited + 2))
-    done
-
-    # Give realtime a few seconds to seed the tenant after the process starts
-    sleep 3
-
-    # Poll for the tenant row to appear (max 30s)
-    local expected_id="realtime-${name}"
-    waited=0
-    while [ $waited -lt 30 ]; do
-        local tenant_count
-        tenant_count=$(docker exec "$db_ctr" psql -U supabase_admin -d "$project_db" -tAc \
-            "SELECT count(*) FROM _realtime.tenants WHERE name='realtime-dev';" 2>/dev/null || echo "0")
-        if [ "$tenant_count" -gt 0 ] 2>/dev/null; then
-            docker exec "$db_ctr" psql -U supabase_admin -d "$project_db" -tAc \
-                "UPDATE _realtime.tenants SET external_id='$expected_id', name='$expected_id' WHERE name='realtime-dev';" \
-                2>/dev/null || true
-            echo "Realtime tenant renamed: realtime-dev -> $expected_id"
-            return 0
-        fi
-        # Also check if the tenant already has the correct name (idempotent)
-        local correct_count
-        correct_count=$(docker exec "$db_ctr" psql -U supabase_admin -d "$project_db" -tAc \
-            "SELECT count(*) FROM _realtime.tenants WHERE name='$expected_id';" 2>/dev/null || echo "0")
-        if [ "$correct_count" -gt 0 ] 2>/dev/null; then
-            return 0
-        fi
-        sleep 2
-        waited=$((waited + 2))
-    done
-
-    # Timed out — not fatal, the container will just show unhealthy
-    echo "WARN: Could not fix realtime tenant for '$name' (timed out waiting for seed)"
 }
 
 _generate_disk_state_from_manifest() {
@@ -1487,11 +1841,16 @@ cmd_rebuild_kong() {
     keyauth_credentials:
       - key: ${service_role_key}"
 
+            # Per-project groups, not the shared anon/admin groups: those also
+            # gate the main stack's routes, including /pg/ (pg-meta connected
+            # as supabase_admin), so a project's service_role key in `admin`
+            # would be a superuser SQL endpoint for the whole cluster. Scoping
+            # also keeps one project's keys out of every other project's routes.
             acls_block="${acls_block}
   - consumer: anon-${proj}
-    group: anon
+    group: anon-${proj}
   - consumer: service_role-${proj}
-    group: admin"
+    group: admin-${proj}"
         fi
     done
 
@@ -1588,8 +1947,8 @@ cmd_rebuild_kong() {
         config:
           hide_groups_header: true
           allow:
-            - admin
-            - anon
+            - admin-${proj}
+            - anon-${proj}
 
   ## REST routes for $proj
   - name: rest-v1-${proj}
@@ -1616,8 +1975,8 @@ cmd_rebuild_kong() {
         config:
           hide_groups_header: true
           allow:
-            - admin
-            - anon
+            - admin-${proj}
+            - anon-${proj}
 
   ## GraphQL routes for $proj
   - name: graphql-v1-${proj}
@@ -1645,8 +2004,8 @@ cmd_rebuild_kong() {
         config:
           hide_groups_header: true
           allow:
-            - admin
-            - anon
+            - admin-${proj}
+            - anon-${proj}
 
   ## Realtime routes for $proj
   - name: realtime-v1-ws-${proj}
@@ -1674,8 +2033,8 @@ cmd_rebuild_kong() {
         config:
           hide_groups_header: true
           allow:
-            - admin
-            - anon
+            - admin-${proj}
+            - anon-${proj}
   - name: realtime-v1-rest-${proj}
     url: http://realtime-${proj}.supabase-realtime:4000/api
     protocol: http
@@ -1701,8 +2060,8 @@ cmd_rebuild_kong() {
         config:
           hide_groups_header: true
           allow:
-            - admin
-            - anon
+            - admin-${proj}
+            - anon-${proj}
 
   ## Storage routes for $proj
   - name: storage-v1-${proj}
@@ -1759,7 +2118,7 @@ cmd_rebuild_kong() {
         config:
           hide_groups_header: true
           allow:
-            - admin
+            - admin-${proj}
 
   ## JWKS route for $proj
   - name: auth-v1-open-jwks-${proj}
@@ -1796,7 +2155,7 @@ EOF
     chmod 644 "$kong_temp"
 
     local kong_ctr
-    kong_ctr=$(docker ps --filter 'label=com.docker.compose.service=kong' --format '{{.Names}}' | head -1)
+    kong_ctr=$(service_container kong supabase-kong)
 
     if [ -z "$kong_ctr" ]; then
         echo "Warning: Kong container not found, skipping reload"
@@ -1808,26 +2167,42 @@ EOF
     # Pipe temp.yml through awk INSIDE the Kong container. ENVIRON in awk picks
     # up Kong's process environment, so all $VAR placeholders resolve correctly.
     # The awk is identical in spirit to kong-entrypoint.sh's substitution.
-    if ! cat "$kong_temp" | docker exec -i "$kong_ctr" sh -c '
-        export LUA_AUTH_EXPR="\$((headers.authorization ~= nil and headers.authorization:sub(1, 10) ~= '"'"'Bearer sb_'"'"' and headers.authorization) or headers.apikey)"
-        export LUA_RT_WS_EXPR="\$(query_params.apikey)"
-        awk '"'"'{
-            line = $0
-            out = ""
-            while (match(line, /\$[A-Za-z_][A-Za-z_0-9]*/)) {
-                varname = substr(line, RSTART + 1, RLENGTH - 1)
-                if (varname in ENVIRON) {
-                    out = out substr(line, 1, RSTART - 1) ENVIRON[varname]
-                } else {
-                    out = out substr(line, 1, RSTART + RLENGTH - 1)
-                }
-                line = substr(line, RSTART + RLENGTH)
-            }
-            print out line
-        }'"'"' > /usr/local/kong/kong.yml.new \
-        && sed -i "/^[[:space:]]*- key:[[:space:]]*$/d" /usr/local/kong/kong.yml.new \
-        && mv /usr/local/kong/kong.yml.new /usr/local/kong/kong.yml
-    '; then
+    #
+    # The LUA_*_EXPR values are exported by kong-entrypoint.sh to Kong's own
+    # process only — `docker exec` sessions don't see them, and nginx overwrites
+    # PID 1's environ when it sets its process title — so derive them here the
+    # same way. This block is copied from docker/volumes/api/kong-entrypoint.sh
+    # (a superset of agent/configs/kong/kong-entrypoint.sh); keep it in sync, or
+    # every rebuild-kong silently drops the opaque sb_ key translation.
+    local kong_render_script
+    read -r -d '' kong_render_script <<'EOS' || true
+if [ -n "$SUPABASE_SECRET_KEY" ] && [ -n "$SUPABASE_PUBLISHABLE_KEY" ]; then
+    export LUA_AUTH_EXPR="\$((headers.authorization ~= nil and headers.authorization:sub(1, 10) ~= 'Bearer sb_' and headers.authorization) or (headers.apikey == '$SUPABASE_SECRET_KEY' and 'Bearer $SERVICE_ROLE_KEY_ASYMMETRIC') or (headers.apikey == '$SUPABASE_PUBLISHABLE_KEY' and 'Bearer $ANON_KEY_ASYMMETRIC') or headers.apikey)"
+    export LUA_RT_WS_EXPR="\$((query_params.apikey == '$SUPABASE_SECRET_KEY' and '$SERVICE_ROLE_KEY_ASYMMETRIC') or (query_params.apikey == '$SUPABASE_PUBLISHABLE_KEY' and '$ANON_KEY_ASYMMETRIC') or query_params.apikey)"
+    export LUA_FUNCTIONS_EXPR="\$((headers.apikey == '$SUPABASE_SECRET_KEY' and '$SERVICE_ROLE_KEY_ASYMMETRIC') or (headers.apikey == '$SUPABASE_PUBLISHABLE_KEY' and '$ANON_KEY_ASYMMETRIC') or (headers.authorization == 'Bearer $SUPABASE_SECRET_KEY' and '$SERVICE_ROLE_KEY_ASYMMETRIC') or (headers.authorization == 'Bearer $SUPABASE_PUBLISHABLE_KEY' and '$ANON_KEY_ASYMMETRIC') or nil)"
+else
+    export LUA_AUTH_EXPR="\$((headers.authorization ~= nil and headers.authorization:sub(1, 10) ~= 'Bearer sb_' and headers.authorization) or headers.apikey)"
+    export LUA_RT_WS_EXPR="\$(query_params.apikey)"
+    export LUA_FUNCTIONS_EXPR="\$(nil)"
+fi
+awk '{
+    line = $0
+    out = ""
+    while (match(line, /\$[A-Za-z_][A-Za-z_0-9]*/)) {
+        varname = substr(line, RSTART + 1, RLENGTH - 1)
+        if (varname in ENVIRON) {
+            out = out substr(line, 1, RSTART - 1) ENVIRON[varname]
+        } else {
+            out = out substr(line, 1, RSTART + RLENGTH - 1)
+        }
+        line = substr(line, RSTART + RLENGTH)
+    }
+    print out line
+}' > /usr/local/kong/kong.yml.new \
+&& sed -i "/^[[:space:]]*- key:[[:space:]]*$/d" /usr/local/kong/kong.yml.new \
+&& mv /usr/local/kong/kong.yml.new /usr/local/kong/kong.yml
+EOS
+    if ! docker exec -i "$kong_ctr" sh -c "$kong_render_script" < "$kong_temp"; then
         echo "Warning: failed to write resolved config into Kong"
         return 1
     fi
@@ -1973,17 +2348,25 @@ usage() {
     echo "Commands:"
     echo "  setup <name>          Create + start a project in one step"
     echo "  create <name>         Create a new project (DB + secrets only)"
-    echo "  destroy <name>        Destroy a project"
+    echo "  destroy <name> [--yes]  Destroy a project (--yes skips the confirmation prompt)"
     echo "  list                  List all projects"
     echo "  up [name]             Start project containers (all if no name)"
     echo "  down [name]           Stop project containers (all if no name)"
     echo "  status [name]         Show container status"
     echo "  client-config <name>  Print client SDK configuration"
     echo "  rebuild-kong          Regenerate Kong config and reload"
+    echo "  reconcile             Recreate started projects' containers to match the main stack"
     echo "  rotate-keys <name>    Rotate JWT secret + anon/service_role keys + database password (restarts containers)"
     echo "  migrate-db-owner <name>  Give a pre-existing project its own database role (one-time backfill)"
     echo "  verify [name]        Check container JWT secrets match manifest"
 }
+
+# State-changing commands run one at a time (see acquire_state_lock).
+case "${1:-}" in
+    setup|create|destroy|up|down|rebuild-kong|rotate-keys|migrate-db-owner)
+        acquire_state_lock
+        ;;
+esac
 
 case "${1:-}" in
     setup)
@@ -1996,7 +2379,7 @@ case "${1:-}" in
         ;;
     destroy)
         [ -z "${2:-}" ] && { echo "Error: project name required"; usage; exit 1; }
-        cmd_destroy "$2"
+        cmd_destroy "$2" "${3:-}"
         ;;
     list)
         cmd_list
@@ -2016,6 +2399,11 @@ case "${1:-}" in
         ;;
     rebuild-kong)
         cmd_rebuild_kong
+        ;;
+    reconcile)
+        _wait_for_main_stack
+        acquire_state_lock
+        cmd_reconcile
         ;;
     rotate-keys)
         [ -z "${2:-}" ] && { echo "Error: project name required"; usage; exit 1; }

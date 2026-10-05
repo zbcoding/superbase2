@@ -10,13 +10,18 @@
  * Exposes, on an internal-only port, bearer-auth'd:
  *   GET  /health
  *   GET  /verify                    Check all projects' JWT secrets match manifest
+ *   GET  /images                    Images the main stack's services are running
  *   POST /rebuild-kong              Regenerate Kong config with per-project routes
  *   POST /projects/:name/up
  *   POST /projects/:name/down
  *   POST /projects/:name/restart
  *   POST /projects/:name/rotate-keys
+ *   POST /projects/:name/destroy    Remove containers, volumes, disk state and Kong routes
  *   GET  /projects/:name/status
  *   GET  /projects/:name/verify     Check single project's JWT secrets match manifest
+ *
+ * On startup it runs `superbase2.sh reconcile`, which recreates started
+ * projects' containers against the freshly deployed main stack.
  *
  * The script + docker directory are bind-mounted at SB2_DOCKER_DIR.
  */
@@ -72,6 +77,28 @@ if (NETWORK_NAME) {
   console.log(`[sb2-agent] compose network: ${NETWORK_NAME}`)
   process.env.SUPABASE_NETWORK_NAME = NETWORK_NAME
 }
+
+// The compose project this agent belongs to (UUID-based on Coolify), used to
+// scope container lookups to this stack. Null when not run by Compose.
+function resolveOwnComposeProject() {
+  try {
+    const hostname = fs.readFileSync('/etc/hostname', 'utf8').trim()
+    const project = execFileSync(
+      'docker',
+      ['inspect', '-f', '{{ index .Config.Labels "com.docker.compose.project" }}', hostname],
+      { encoding: 'utf8' }
+    ).trim()
+    return project || null
+  } catch (err) {
+    console.warn('[sb2-agent] could not resolve own compose project:', err.message)
+    return null
+  }
+}
+
+const OWN_PROJECT = resolveOwnComposeProject()
+
+// Where superbase2.sh keeps per-project state (mirrors its SB2_STATE_DIR default).
+const STATE_DIR = process.env.SB2_STATE_DIR || `${DOCKER_DIR}/superbase2`
 
 // Docker DNS / Compose project names restrict to letters, digits, underscores,
 // and hyphens. SuperBase² itself restricts project names further (letters +
@@ -209,15 +236,24 @@ const server = http.createServer(async (req, res) => {
 
     // Global rebuild-kong: regenerate Kong config with per-project routes
     if (path === '/rebuild-kong' && req.method === 'POST') {
-      if (!authorized(req)) {
-        return json(res, 401, { error: { message: 'Unauthorized' } })
-      }
       const result = await runScript(['rebuild-kong'])
       return json(res, result.ok ? 200 : 500, result)
     }
 
+    // Images of the main stack's running services, for Studio's upgrade check.
+    // Read from Docker rather than a compose file: on Coolify the deployed
+    // compose file lives outside every container.
+    if (path === '/images' && req.method === 'GET') {
+      if (!OWN_PROJECT) {
+        return json(res, 500, { error: { message: 'Agent is not running under Docker Compose' } })
+      }
+      return json(res, 200, { images: mainStackImages() })
+    }
+
     // /projects/:name/<action>
-    const m = path.match(/^\/projects\/([^\/]+)\/(up|down|restart|status|rotate-keys|verify)$/)
+    const m = path.match(
+      /^\/projects\/([^\/]+)\/(up|down|restart|status|rotate-keys|destroy|verify)$/
+    )
     if (m) {
       const name = decodeURIComponent(m[1])
       const action = m[2]
@@ -249,7 +285,9 @@ const server = http.createServer(async (req, res) => {
       // Container restart is the caller's responsibility (Studio fires it
       // async after responding so the browser doesn't hit a proxy timeout).
       const extraEnv = action === 'rotate-keys' ? { SB2_ROTATE_SKIP_RESTART: '1' } : {}
-      const result = await runScript([action, name], extraEnv)
+      // destroy prompts for confirmation on a terminal; the caller confirmed in the UI.
+      const args = action === 'destroy' ? ['destroy', name, '--yes'] : [action, name]
+      const result = await runScript(args, extraEnv)
       return json(res, result.ok ? 200 : 500, result)
     }
 
@@ -265,54 +303,171 @@ const server = http.createServer(async (req, res) => {
 // When Coolify redeploys the main stack, it recreates the Kong container from
 // the base image. The per-project routes injected by `rebuild-kong` are lost,
 // so all /project/<ref>/* paths return 404 until someone manually runs
-// rebuild-kong. This guard checks on startup (and periodically) whether the
-// Kong config has per-project routes, rebuilding automatically if missing.
+// rebuild-kong. This guard checks periodically that every project on disk has
+// its routes in Kong's live config, rebuilding if any are missing.
 
-async function getKongContainerName() {
+function getKongContainerName() {
+  const args = ['ps', '--filter', 'label=com.docker.compose.service=kong']
+  // Scope to this stack so another stack's `kong` service is never picked up.
+  if (OWN_PROJECT) args.push('--filter', `label=com.docker.compose.project=${OWN_PROJECT}`)
+  args.push('--format', '{{.Names}}')
   try {
-    const raw = execFileSync('docker', ['ps', '--filter', 'label=com.docker.compose.service=kong', '--format', '{{.Names}}'], { encoding: 'utf8' })
-    return raw.split('\n').map(s => s.trim()).find(Boolean) || null
-  } catch { return null }
+    const raw = execFileSync('docker', args, { encoding: 'utf8' })
+    return raw.split('\n').map((s) => s.trim()).find(Boolean) || null
+  } catch {
+    return null
+  }
 }
 
-async function kongHasProjectRoutes() {
-  const kongCtr = await getKongContainerName()
-  if (!kongCtr) return false
+// Refs of the projects rebuild-kong generates routes for: those with a .env
+// under STATE_DIR/projects (same source as superbase2.sh list_projects).
+function expectedProjectRefs() {
+  const projectsDir = `${STATE_DIR}/projects`
+  let names
   try {
-    // Check if any /project/ routes exist in the kong.yml
-    const raw = execFileSync('docker', ['exec', kongCtr, 'grep', '-c', '/project/', '/usr/local/kong/kong.yml'], { encoding: 'utf8' })
-    const count = parseInt(raw.trim(), 10)
-    return count > 0
-  } catch {
-    // grep returns exit 1 if no matches, which throws
-    return false
+    names = fs.readdirSync(projectsDir)
+  } catch (err) {
+    if (err.code === 'ENOENT') return []
+    throw err
   }
+  const refs = []
+  for (const name of names) {
+    let env
+    try {
+      env = fs.readFileSync(`${projectsDir}/${name}/.env`, 'utf8')
+    } catch {
+      continue
+    }
+    const ref = env.match(/^PROJECT_REF=(.+)$/m)?.[1]?.trim()
+    if (ref) refs.push(ref)
+  }
+  return refs
+}
+
+function missingKongRefs(kongCtr, refs) {
+  const config = execFileSync('docker', ['exec', kongCtr, 'cat', '/usr/local/kong/kong.yml'], {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  })
+  return refs.filter((ref) => !config.includes(`/project/${ref}/`))
 }
 
 async function ensureKongRoutes() {
-  const hasRoutes = await kongHasProjectRoutes()
-  if (hasRoutes) {
-    console.log('[sb2-agent] Kong per-project routes OK')
-    return
+  try {
+    const refs = expectedProjectRefs()
+    if (refs.length === 0) return
+    const kongCtr = getKongContainerName()
+    if (!kongCtr) {
+      console.warn('[sb2-agent] Kong container not found; skipping route check')
+      return
+    }
+    const missing = missingKongRefs(kongCtr, refs)
+    if (missing.length === 0) return
+    console.log(`[sb2-agent] Kong routes missing for ${missing.join(', ')} — rebuilding...`)
+    const result = await runScript(['rebuild-kong'])
+    if (result.ok) {
+      console.log('[sb2-agent] Kong rebuilt successfully')
+    } else {
+      console.error('[sb2-agent] Kong rebuild FAILED:', result.stderr || result.stdout)
+    }
+  } catch (err) {
+    console.error('[sb2-agent] Kong route check failed:', err.message)
   }
-  console.log('[sb2-agent] Kong per-project routes MISSING — rebuilding...')
-  const result = await runScript(['rebuild-kong'])
+}
+
+// ── Image drift ──────────────────────────────────────────────────────────────
+//
+// Per-project containers run the main stack's images (superbase2.sh exports
+// them on every `up`). A redeploy that changes those images doesn't always
+// recreate this agent, so the startup reconcile alone can miss it; compare
+// periodically and reconcile when they diverge.
+
+// Compose labels and configured image of every container matching `filters`.
+function inspectContainers(filters) {
+  const ids = execFileSync('docker', ['ps', '-aq', ...filters.flatMap((f) => ['--filter', f])], {
+    encoding: 'utf8',
+  })
+    .split('\n')
+    .filter(Boolean)
+  if (ids.length === 0) return []
+  const raw = execFileSync(
+    'docker',
+    [
+      'inspect',
+      '-f',
+      '{{index .Config.Labels "com.docker.compose.project"}}\t{{index .Config.Labels "com.docker.compose.service"}}\t{{.Config.Image}}\t{{.State.Running}}',
+      ...ids,
+    ],
+    { encoding: 'utf8' }
+  )
+  return raw
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => {
+      const [project, service, image, running] = line.split('\t')
+      return { project, service, image, running: running === 'true' }
+    })
+}
+
+function mainStackImages() {
+  const images = {}
+  for (const c of inspectContainers([`label=com.docker.compose.project=${OWN_PROJECT}`])) {
+    if (c.running && c.service) images[c.service] = c.image
+  }
+  return images
+}
+
+// Per-project containers (compose project `supabase-<name>`) whose image
+// differs from the main-stack service they mirror, e.g. `auth-foo` vs `auth`.
+function driftedProjects() {
+  const main = mainStackImages()
+  const drifted = new Set()
+  for (const c of inspectContainers(['label=com.docker.compose.project'])) {
+    if (c.project === OWN_PROJECT || !c.project.startsWith('supabase-')) continue
+    const name = c.project.slice('supabase-'.length)
+    if (!c.service.endsWith(`-${name}`)) continue
+    const base = c.service.slice(0, -(name.length + 1))
+    if (main[base] && main[base] !== c.image) drifted.add(name)
+  }
+  return [...drifted]
+}
+
+async function reconcile(reason) {
+  console.log(`[sb2-agent] reconciling per-project containers (${reason})...`)
+  const result = await runScript(['reconcile'])
   if (result.ok) {
-    console.log('[sb2-agent] Kong rebuilt successfully')
+    console.log('[sb2-agent] reconcile done:\n' + result.stdout)
   } else {
-    console.error('[sb2-agent] Kong rebuild FAILED:', result.stderr || result.stdout)
+    console.error('[sb2-agent] reconcile FAILED:\n' + (result.stderr || result.stdout))
+  }
+}
+
+async function periodicCheck() {
+  let drifted = []
+  if (OWN_PROJECT) {
+    try {
+      drifted = driftedProjects()
+    } catch (err) {
+      console.error('[sb2-agent] image drift check failed:', err.message)
+    }
+  }
+  // reconcile rebuilds Kong too, so it covers the route check.
+  if (drifted.length > 0) {
+    await reconcile(`images differ from the main stack for ${drifted.join(', ')}`)
+  } else {
+    await ensureKongRoutes()
   }
 }
 
 // Check every 5 minutes (Coolify can redeploy at any time)
-const KONG_CHECK_INTERVAL_MS = 5 * 60 * 1000
+const CHECK_INTERVAL_MS = 5 * 60 * 1000
 
 server.listen(PORT, async () => {
   console.log(`[sb2-agent] listening on :${PORT} (docker_dir=${DOCKER_DIR})`)
-  // Initial check on startup
-  await ensureKongRoutes()
-  // Periodic check
-  setInterval(ensureKongRoutes, KONG_CHECK_INTERVAL_MS)
+  // Bring started projects in line with the (re)deployed main stack. This
+  // also rebuilds Kong, so it replaces an initial route check.
+  await reconcile('startup')
+  setInterval(periodicCheck, CHECK_INTERVAL_MS)
 })
 
 const shutdown = () => {

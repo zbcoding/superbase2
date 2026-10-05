@@ -67,13 +67,11 @@ services:
     environment:
       SUPERBASE2_ENABLED: "true"
       SUPERBASE2_MANIFEST: /etc/superbase2/projects.json
-      SUPERBASE2_COMPOSE_FILE: /etc/superbase2/docker-compose.yml
       SUPERBASE2_COMPOSE_CMD: "docker compose -f docker-compose.yml -f docker-compose.superbase2.yml"
       SB2_AGENT_URL: http://sb2-agent:8088
       SB2_AGENT_TOKEN: ${SB2_AGENT_TOKEN}
     volumes:
       - ${SUPERBASE2_DIR:-./superbase2}/projects.json:/etc/superbase2/projects.json:z
-      - ./docker-compose.yml:/etc/superbase2/docker-compose.yml:ro,z
 
   # ─── SuperBase² Agent ─────────────────────────────────────────────────────
   # Host-Docker broker so Studio can start/stop/restart per-project stacks
