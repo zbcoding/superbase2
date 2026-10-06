@@ -2312,8 +2312,12 @@ EOF
     # process only — `docker exec` sessions don't see them, and nginx overwrites
     # PID 1's environ when it sets its process title — so derive them here the
     # same way. This block is copied from docker/volumes/api/kong-entrypoint.sh
-    # (a superset of agent/configs/kong/kong-entrypoint.sh); keep it in sync, or
-    # every rebuild-kong silently drops the opaque sb_ key translation.
+    # (agent/configs/kong/kong-entrypoint.sh is a copy of it); keep it in sync,
+    # or every rebuild-kong silently drops the opaque sb_ key translation.
+    #
+    # Key lines whose placeholder stays unresolved (the variable isn't in
+    # Kong's environment) are dropped too: left in, the literal text
+    # `$SUPABASE_SECRET_KEY` would itself be a valid service_role key.
     local kong_render_script
     read -r -d '' kong_render_script <<'EOS' || true
 if [ -n "$SUPABASE_SECRET_KEY" ] && [ -n "$SUPABASE_PUBLISHABLE_KEY" ]; then
@@ -2339,7 +2343,8 @@ awk '{
     }
     print out line
 }' > /usr/local/kong/kong.yml.new \
-&& sed -i "/^[[:space:]]*- key:[[:space:]]*$/d" /usr/local/kong/kong.yml.new \
+&& sed -i -e "/^[[:space:]]*- key:[[:space:]]*$/d" \
+    -e '/^[[:space:]]*- key:[[:space:]]*\$/d' /usr/local/kong/kong.yml.new \
 && mv /usr/local/kong/kong.yml.new /usr/local/kong/kong.yml
 EOS
     if ! docker exec -i "$kong_ctr" sh -c "$kong_render_script" < "$kong_temp"; then

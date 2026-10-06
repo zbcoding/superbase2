@@ -361,6 +361,13 @@ services:
       #KONG_SSL_CERT_KEY: /home/kong/server.key
       SUPABASE_ANON_KEY: ${ANON_KEY}
       SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      # Must be set (empty is fine): kong-entrypoint.sh leaves placeholders for
+      # unset variables as literal text, so a missing SUPABASE_SECRET_KEY made
+      # the string "$SUPABASE_SECRET_KEY" a working service_role key.
+      SUPABASE_PUBLISHABLE_KEY: ${SUPABASE_PUBLISHABLE_KEY:-}
+      SUPABASE_SECRET_KEY: ${SUPABASE_SECRET_KEY:-}
+      ANON_KEY_ASYMMETRIC: ${ANON_KEY_ASYMMETRIC:-}
+      SERVICE_ROLE_KEY_ASYMMETRIC: ${SERVICE_ROLE_KEY_ASYMMETRIC:-}
       DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-supabase}
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
     entrypoint: /home/kong/kong-entrypoint.sh
