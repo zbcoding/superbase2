@@ -165,7 +165,7 @@ Coolify expects a single compose file — it does not support the multi-file `-f
 
 10. Deploy — Coolify pulls the pre-built Studio image from ghcr.io (fast, no build step).
 
-11. (Optional) **Redeploy from CI.** `.github/workflows/build-studio-image.yml` builds the Studio image on pushes to `master` and `development` and can redeploy Coolify afterwards. Add GitHub secrets `COOLIFY_WEBHOOK` (master's app) and/or `COOLIFY_WEBHOOK_DEVELOPMENT` (a separate test app), plus `COOLIFY_TOKEN` (a Coolify API token with deploy and write access). Also create a `STUDIO_IMAGE_TAG` variable on each Coolify app: the workflow sets it to the commit SHA it just built before redeploying, so Studio always matches the compose file and agent deployed next to it.
+11. (Optional) **Redeploy from CI.** `.github/workflows/build-studio-image.yml` builds the Studio image on pushes to `master` (`:latest`) and `development` (`:development`) that touch Studio, then calls the Coolify deploy webhook. Add GitHub secrets `COOLIFY_WEBHOOK` (the app's deploy webhook URL) and `COOLIFY_TOKEN` (a Coolify API token with deploy access). With auto-deploy on, a push deploys twice: Coolify deploys the compose and agent right away with the previous Studio image, then the webhook redeploys once CI has pushed the new one.
 
 ### What happens on first boot
 

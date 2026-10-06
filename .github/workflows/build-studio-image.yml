@@ -29,11 +29,6 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    env:
-      # Job-level, not step-level: a step's own `env` is not visible to its `if`.
-      # Each branch redeploys its own Coolify application, so a development
-      # push can never redeploy production.
-      COOLIFY_WEBHOOK: ${{ github.ref_name == 'master' && secrets.COOLIFY_WEBHOOK || github.ref_name == 'development' && secrets.COOLIFY_WEBHOOK_DEVELOPMENT || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -60,33 +55,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # A missing secret would otherwise skip the redeploy without a trace.
-      - name: Warn when no Coolify webhook is set for this branch
-        if: success() && env.COOLIFY_WEBHOOK == '' && (github.ref_name == 'master' || github.ref_name == 'development')
-        run: |
-          echo "::warning title=Coolify redeploy skipped::Repository secret ${{ github.ref_name == 'master' && 'COOLIFY_WEBHOOK' || 'COOLIFY_WEBHOOK_DEVELOPMENT' }} is not set, so Coolify was not redeployed with this image."
-
-      # Pin the Coolify app to the image this run just built, then redeploy.
-      # A moving tag (:latest / :development) lets a redeploy pull a Studio
-      # built from a different commit than the compose file and agent it runs
-      # beside. Requires a STUDIO_IMAGE_TAG variable to exist on the Coolify
-      # application (the API only updates existing variables).
       - name: Trigger Coolify redeploy
         if: success() && env.COOLIFY_WEBHOOK != ''
         env:
+          COOLIFY_WEBHOOK: ${{ secrets.COOLIFY_WEBHOOK }}
           COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
         run: |
-          # The deploy webhook is <coolify>/api/v1/deploy?uuid=<app-uuid>[&...].
-          COOLIFY_API="${COOLIFY_WEBHOOK%%/api/v1/*}/api/v1"
-          APP_UUID=$(printf '%s' "$COOLIFY_WEBHOOK" | sed -n 's/.*[?&]uuid=\([^&]*\).*/\1/p')
-          if [ -z "$APP_UUID" ]; then
-            echo "COOLIFY_WEBHOOK has no uuid= parameter: expected <coolify>/api/v1/deploy?uuid=<app-uuid>" >&2
-            exit 1
-          fi
-          curl --fail-with-body -X PATCH "$COOLIFY_API/applications/$APP_UUID/envs" \
-            -H "Authorization: Bearer $COOLIFY_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"key\":\"STUDIO_IMAGE_TAG\",\"value\":\"${{ github.sha }}\"}"
           curl --fail-with-body -X GET "$COOLIFY_WEBHOOK" \
             -H "Authorization: Bearer $COOLIFY_TOKEN"
 
