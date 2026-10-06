@@ -284,7 +284,10 @@ filter_disabled_services() {
 
     local tmp_file
     tmp_file=$(mktemp)
-    trap 'rm -f "$tmp_file" "${tmp_file}.new"' EXIT
+    # Expand the path now: the EXIT trap can fire after this function returns
+    # (reconcile runs each project in a subshell), when the local is gone and
+    # `set -u` would abort on it.
+    trap "rm -f '$tmp_file' '$tmp_file.new'" EXIT
     cp "$compose_file" "$tmp_file"
 
     for svc in $disabled; do
