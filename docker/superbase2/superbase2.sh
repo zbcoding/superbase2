@@ -126,12 +126,39 @@ db_container() {
 
 # Kong is the `kong` service in docker-compose.coolify.yml, but upstream's
 # docker-compose.kong.yml (used by the standalone overlay) turns `api-gw` into
-# Kong, container `supabase-kong`.
+# Kong, container `supabase-kong`. Without that override `api-gw` is Envoy,
+# so check the image before treating the container as Kong.
 kong_container() {
-    local found
-    found=$(service_container kong supabase-kong)
-    [ -n "$found" ] || found=$(service_container api-gw supabase-kong)
-    echo "$found"
+    local service found
+    for service in kong api-gw; do
+        found=$(service_container "$service" supabase-kong)
+        [ -n "$found" ] || continue
+        case "$(docker inspect -f '{{.Config.Image}}' "$found" 2>/dev/null)" in
+            *kong*) echo "$found"; return ;;
+        esac
+    done
+}
+
+# kong/kong images run as kong, uid/gid 1001.
+KONG_UID=1001
+
+# Install the rendered Kong config at $2. It carries every project's API keys,
+# so it is readable by Kong's user only. Non-root host runs can't chown, so
+# they do it through a throwaway container (alpine:3.19 is already pulled for
+# superbase2-init). The rename works either way: the directory is ours.
+install_kong_config() {
+    local src="$1" dest="$2" staged="$2.new"
+    cp "$src" "$staged"
+    chmod 600 "$staged"
+    if [ "$(id -u)" = 0 ]; then
+        chown "$KONG_UID:$KONG_UID" "$staged"
+    elif ! docker run --rm --user 0 --entrypoint chown \
+            -v "$(dirname "$staged"):/api:z" alpine:3.19 \
+            "$KONG_UID:$KONG_UID" "/api/$(basename "$staged")" >/dev/null 2>&1; then
+        echo "Warning: couldn't hand $dest to Kong's user; leaving it world-readable"
+        chmod 644 "$staged"
+    fi
+    mv -f "$staged" "$dest"
 }
 
 # Serialize every state-changing command (create, destroy, up, down,
@@ -2291,8 +2318,7 @@ EOF
     # are all set — and pipe the result to /usr/local/kong/kong.yml, then call
     # `kong reload` (sub-second, no connection drop) instead of `docker restart`
     # (5-10s outage hitting every project).
-    mv "$kong_tmp" "$kong_temp"
-    chmod 644 "$kong_temp"
+    install_kong_config "$kong_tmp" "$kong_temp"
 
     local kong_ctr
     kong_ctr=$(kong_container)
@@ -2347,7 +2373,7 @@ awk '{
     -e '/^[[:space:]]*- key:[[:space:]]*\$/d' /usr/local/kong/kong.yml.new \
 && mv /usr/local/kong/kong.yml.new /usr/local/kong/kong.yml
 EOS
-    if ! docker exec -i "$kong_ctr" sh -c "$kong_render_script" < "$kong_temp"; then
+    if ! docker exec -i "$kong_ctr" sh -c "$kong_render_script" < "$kong_tmp"; then
         echo "Warning: failed to write resolved config into Kong"
         return 1
     fi

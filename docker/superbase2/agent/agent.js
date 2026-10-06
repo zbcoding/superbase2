@@ -331,16 +331,20 @@ const server = http.createServer(async (req, res) => {
 
 // Kong is the `kong` service in docker-compose.coolify.yml and the `api-gw`
 // service (via upstream's docker-compose.kong.yml) in the standalone overlay.
+// Without that override `api-gw` is Envoy, so require a Kong image.
 function getKongContainerName() {
   for (const service of ['kong', 'api-gw']) {
     const args = ['ps', '--filter', `label=com.docker.compose.service=${service}`]
     // Scope to this stack so another stack's gateway is never picked up.
     if (OWN_PROJECT) args.push('--filter', `label=com.docker.compose.project=${OWN_PROJECT}`)
-    args.push('--format', '{{.Names}}')
+    args.push('--format', '{{.Names}}\t{{.Image}}')
     try {
       const raw = execFileSync('docker', args, { encoding: 'utf8' })
-      const name = raw.split('\n').map((s) => s.trim()).find(Boolean)
-      if (name) return name
+      const kong = raw
+        .split('\n')
+        .map((line) => line.trim().split('\t'))
+        .find(([name, image]) => name && image?.includes('kong'))
+      if (kong) return kong[0]
     } catch {
       // Docker unavailable: no container under either name.
     }

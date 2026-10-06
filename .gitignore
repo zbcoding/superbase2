@@ -180,4 +180,5 @@ docker/superbase2/projects.json
 docker/superbase2/projects.json.lock
 docker/superbase2/projects/
 docker/volumes/api/temp.yml
+docker/volumes/api/temp.yml.new
 docker/volumes/api/kong.yml.bak

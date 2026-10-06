@@ -51,10 +51,17 @@ SuperBase² is designed so that updating Supabase is painless:
 # so plain `docker compose` picks up the Kong and SuperBase² overlays.
 # --ignore-buildable skips sb2-agent (built locally); --build rebuilds it
 # from the pulled superbase2/ sources.
-git pull upstream master
+git pull
 cd docker
 docker compose pull --ignore-buildable
 docker compose up -d --build
+
+# One-time, for checkouts from before docker/superbase2/projects.json became
+# untracked runtime state: if `git pull` refuses with "Your local changes ...
+# would be overwritten", set your manifest aside, pull, and put it back:
+cd docker/superbase2
+mv projects.json projects.json.keep && git checkout -- projects.json
+git pull && mv projects.json.keep projects.json
 
 # Upgrading (Coolify): merge upstream, then re-generate the Coolify compose file.
 # See the Coolify section below for details.

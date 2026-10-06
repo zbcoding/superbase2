@@ -37,9 +37,10 @@ basicauth_credentials:
 ###
 ### API Routes
 ###
-### Default project routes (original Supabase self-hosted routes)
-### are preserved below. Per-project routes are appended by
-### superbase2.sh rebuild-kong.
+### SuperBase²: upstream docker/volumes/api/kong.yml plus the
+### SUPERBASE2_* markers, the dashboard-public routes and Studio's
+### basic-auth hide_credentials. Re-copy from upstream when it changes.
+### Per-project routes are appended by superbase2.sh rebuild-kong.
 ###
 services:
   ## Open Auth routes
@@ -84,6 +85,26 @@ services:
     plugins:
       - name: cors
 
+  - name: auth-v1-open-sso-acs
+    url: "http://auth:9999/sso/saml/acs"
+    routes:
+      - name: auth-v1-open-sso-acs
+        strip_path: true
+        paths:
+        - /auth/v1/sso/saml/acs
+    plugins:
+      - name: cors
+
+  - name: auth-v1-open-sso-metadata
+    url: "http://auth:9999/sso/saml/metadata"
+    routes:
+      - name: auth-v1-open-sso-metadata
+        strip_path: true
+        paths:
+        - /auth/v1/sso/saml/metadata
+    plugins:
+      - name: cors
+
   ## Secure Auth routes
   - name: auth-v1
     _comment: 'Auth: /auth/v1/* -> http://auth:9999/*'
@@ -112,6 +133,33 @@ services:
           allow:
             - admin
             - anon
+
+  ## OpenAPI root - admin only
+  - name: rest-v1-openapi
+    _comment: 'PostgREST OpenAPI root: /rest/v1/ -> <http://rest:3000/> (admin only). See <https://github.com/orgs/supabase/discussions/42949>'
+    url: http://rest:3000/
+    routes:
+      - name: rest-v1-openapi-root
+        strip_path: true
+        expression: 'http.path == "/rest/v1/"'
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: false
+      - name: request-transformer
+        config:
+          add:
+            headers:
+              - "Authorization: $LUA_AUTH_EXPR"
+          replace:
+            headers:
+              - "Authorization: $LUA_AUTH_EXPR"
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
 
   ## Secure PostgREST routes
   - name: rest-v1
@@ -202,6 +250,38 @@ services:
             - admin
             - anon
 
+  # Block access to /realtime/v1/api/openapi
+  - name: realtime-v1-rest-openapi
+    _comment: 'Realtime: /realtime/v1/api/openapi/* -> http://realtime:4000/api/openapi/* (blocked)'
+    url: http://realtime-dev.supabase-realtime:4000/api/openapi
+    protocol: http
+    routes:
+      - name: realtime-v1-rest-openapi
+        strip_path: true
+        paths:
+          - /realtime/v1/api/openapi
+    plugins:
+      - name: request-termination
+        config:
+          status_code: 403
+          message: "Access is forbidden."
+
+  # Block access to /realtime/v1/api/tenants
+  - name: realtime-v1-rest-tenants
+    _comment: 'Realtime: /realtime/v1/api/tenants/* -> http://realtime:4000/api/tenants/* (blocked)'
+    url: http://realtime-dev.supabase-realtime:4000/api/tenants
+    protocol: http
+    routes:
+      - name: realtime-v1-rest-tenants
+        strip_path: true
+        paths:
+          - /realtime/v1/api/tenants
+    plugins:
+      - name: request-termination
+        config:
+          status_code: 403
+          message: "Access is forbidden."
+
   - name: realtime-v1-rest
     _comment: 'Realtime: /realtime/v1/api/* -> http://realtime:4000/api/*'
     url: http://realtime-dev.supabase-realtime:4000/api
@@ -231,7 +311,15 @@ services:
             - admin
             - anon
 
-  ## Storage routes
+  ## Storage API endpoint (with Authorization header transformation).
+  ## No key-auth - S3 protocol requests don't carry an apikey header.
+  ##
+  ## The request-transformer translates opaque API keys to asymmetric JWTs
+  ## and passes through existing Authorization headers (user JWTs, AWS SigV4).
+  ## When no Authorization or apikey header is present (S3 presigned URLs),
+  ## the Lua expression evaluates to nil which Kong renders as empty string.
+  ## The post-function strips this empty header so Storage's S3 signature
+  ## verification falls through to query-parameter parsing.
   - name: storage-v1
     _comment: 'Storage: /storage/v1/* -> http://storage:5000/*'
     url: http://storage:5000/
@@ -260,10 +348,26 @@ services:
               end
 
   ## Edge Functions routes
+  ##
+  ## Functions header handling: opaque sb_ keys are translated to the pre-signed
+  ## internal asymmetric JWT and injected as a raw `sb-api-key` header (no
+  ## `Bearer` prefix), while `Authorization` is left untouched so user-session
+  ## JWTs and legacy bearers flow through to the runtime.
+  ##
+  ## No `key-auth`: Functions is a passthrough that does NOT validate keys. Kong
+  ## cannot reject an invalid key while still letting unauthenticated requests
+  ## through (key-auth's `anonymous` fallback accepts missing AND invalid keys
+  ## alike), so unknown/invalid keys simply pass to the runtime, which handles
+  ## verify_jwt itself.
+  ##
+  ## The request-transformer strips any client-supplied `sb-api-key` (anti-spoof)
+  ## and re-adds the translated value; on no match the Lua expression yields nil
+  ## (an empty header) which the post-function then removes.
   - name: functions-v1
     _comment: 'Edge Functions: /functions/v1/* -> http://functions:9000/*'
     url: http://functions:9000/
-    read_timeout: 150000
+    # Limit inactivity between reads, leaving 10s for the runtime's 150s idle timeout.
+    read_timeout: 160000
     routes:
       - name: functions-v1-all
         strip_path: true
@@ -271,6 +375,22 @@ services:
           - /functions/v1/
     plugins:
       - name: cors
+      - name: request-transformer
+        config:
+          remove:
+            headers:
+              - "sb-api-key"
+          add:
+            headers:
+              - "sb-api-key:$LUA_FUNCTIONS_EXPR"
+      - name: post-function
+        config:
+          access:
+            - |
+              local v = kong.request.get_header("sb-api-key")
+              if v == nil or v == "" or v:find("^%s*$") then
+                kong.service.request.clear_header("sb-api-key")
+              end
 
   ## OAuth 2.0 Authorization Server Metadata (RFC 8414)
   - name: well-known-oauth
@@ -283,6 +403,31 @@ services:
           - /.well-known/oauth-authorization-server
     plugins:
       - name: cors
+
+  ## Analytics routes
+  ## Not used - Studio and Vector talk directly to analytics via Docker networking.
+  ## If external access is needed, add routes with key-auth matching Logflare's x-api-key auth.
+  # - name: analytics-v1-api
+  #   _comment: 'Analytics: /analytics/v1/api/endpoints/* -> http://logflare:4000/api/endpoints/*'
+  #   url: http://analytics:4000/api/endpoints
+  #   routes:
+  #     - name: analytics-v1-api
+  #       strip_path: true
+  #       paths:
+  #         - /analytics/v1/api/endpoints/
+  # - name: analytics-v1
+  #   _comment: 'Analytics: /analytics/v1/* -> http://logflare:4000/*'
+  #   url: http://analytics:4000/
+  #   routes:
+  #     - name: dashboard-v1-all
+  #       strip_path: true
+  #       paths:
+  #         - /analytics/v1
+  #   plugins:
+  #     - name: cors
+  #     - name: basic-auth
+  #       config:
+  #         hide_credentials: true
 
   ## Secure Database routes
   - name: meta
@@ -328,10 +473,22 @@ services:
         paths:
           - /mcp
     plugins:
+      # Block access to /mcp by default
       - name: request-termination
         config:
           status_code: 403
           message: "Access is forbidden."
+      # Enable local access (danger zone!)
+      # 1. Comment out the 'request-termination' section above
+      # 2. Uncomment the entire section below, including 'deny'
+      # 3. Add your local IPs to the 'allow' list
+      #- name: cors
+      #- name: ip-restriction
+      #  config:
+      #    allow:
+      #      - 127.0.0.1
+      #      - ::1
+      #    deny: []
 
   ## Public Dashboard static assets - no basic-auth (PWA manifest is fetched
   ## without credentials per spec, so it must be reachable without basic-auth)

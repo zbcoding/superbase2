@@ -350,6 +350,9 @@ services:
       KONG_PORT_MAPS: "443:8000"
       KONG_DATABASE: "off"
       KONG_DECLARATIVE_CONFIG: /usr/local/kong/kong.yml
+      # Upstream kong.yml's rest-v1-openapi-root route uses `expression:`,
+      # which Kong rejects under the default traditional_compatible router.
+      KONG_ROUTER_FLAVOR: expressions
       # https://github.com/supabase/cli/issues/14
       KONG_DNS_ORDER: LAST,A,CNAME
       KONG_DNS_NOT_FOUND_TTL: 1

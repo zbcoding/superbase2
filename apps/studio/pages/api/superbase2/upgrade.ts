@@ -160,7 +160,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     upgradeInstructions:
       hasUpdates && !isCoolifyDeployment
         ? [
-            'git pull upstream master',
+            'git pull',
             `${composeCmd} pull --ignore-buildable`,
             `${composeCmd} up -d --build`,
           ]

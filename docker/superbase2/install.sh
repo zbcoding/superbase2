@@ -153,6 +153,9 @@ fi
 # SuperBase² routes projects through Kong, so layer upstream's Kong override
 # and the SuperBase² overlay via COMPOSE_FILE in .env. Every plain
 # `docker compose` (and `sh run.sh`) in docker/ then uses the same stack.
+# The superbase2 overlay must come after kong (it overrides Kong's config
+# mount), so drop it first in case an earlier setup listed it before kong.
+sh run.sh config remove superbase2 >/dev/null
 sh run.sh config add kong superbase2 >/dev/null
 ok "$(grep '^COMPOSE_FILE=' .env)"
 
