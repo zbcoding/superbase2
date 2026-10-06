@@ -148,23 +148,35 @@ if [ ! -f "$SCRIPT_DIR/projects.json" ]; then
     echo '{ "projects": [] }' > "$SCRIPT_DIR/projects.json"
 fi
 
-# ─── Build Studio from source ────────────────────────────────────────────────
+# ─── Compose file stack ─────────────────────────────────────────────────────
 
-info "Building Studio from source (first run: 5-15 min, subsequent runs are fast)..."
-docker compose -f docker-compose.yml -f docker-compose.superbase2.yml build studio
-ok "Studio built"
+# SuperBase² routes projects through Kong, so layer upstream's Kong override
+# and the SuperBase² overlay via COMPOSE_FILE in .env. Every plain
+# `docker compose` (and `sh run.sh`) in docker/ then uses the same stack.
+sh run.sh config add kong superbase2 >/dev/null
+ok "$(grep '^COMPOSE_FILE=' .env)"
 
-# ─── Pull remaining images ───────────────────────────────────────────────────
+# CI publishes Studio as :latest from master and :development from
+# development; pick the one matching this checkout unless .env pins it.
+if ! grep -q '^STUDIO_IMAGE_TAG=' .env; then
+    studio_tag=latest
+    if [ "$(git -C "$DOCKER_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)" = development ]; then
+        studio_tag=development
+    fi
+    printf '\n# SuperBase² Studio image tag (ghcr.io/zbcoding/superbase2-studio)\nSTUDIO_IMAGE_TAG=%s\n' "$studio_tag" >> .env
+fi
+
+# ─── Pull images ─────────────────────────────────────────────────────────────
 
 info "Pulling Docker images (this may take a few minutes)..."
-# --ignore-buildable skips Studio since it has a build: section and was just built above
-docker compose -f docker-compose.yml -f docker-compose.superbase2.yml pull --ignore-buildable
+# --ignore-buildable skips sb2-agent, which `up` builds locally.
+docker compose pull --ignore-buildable
 ok "Images pulled"
 
 # ─── Start shared infrastructure ────────────────────────────────────────────
 
 info "Starting shared infrastructure..."
-docker compose -f docker-compose.yml -f docker-compose.superbase2.yml up -d
+docker compose up -d --build
 ok "Shared infrastructure running"
 
 # ─── Wait for Postgres to be ready ──────────────────────────────────────────
@@ -230,7 +242,6 @@ echo "    ./superbase2.sh status           Show container status"
 echo "    ./superbase2.sh client-config <name>"
 echo ""
 echo -e "  ${BOLD}Upgrade Supabase:${NC}"
-echo "    git pull upstream master"
-echo "    docker compose -f docker-compose.yml -f docker-compose.superbase2.yml pull"
-echo "    docker compose -f docker-compose.yml -f docker-compose.superbase2.yml up -d"
+echo "    git pull"
+echo "    cd $DOCKER_DIR && docker compose pull --ignore-buildable && docker compose up -d --build"
 echo ""

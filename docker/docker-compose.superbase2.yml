@@ -1,11 +1,14 @@
 # SuperBase² — multi-project overlay for self-hosted Supabase.
 #
-# Apply on top of the unmodified upstream docker-compose.yml:
+# Apply on top of the unmodified upstream docker-compose.yml and upstream's
+# Kong gateway override (SuperBase² routes projects through Kong, not Envoy):
 #   cd docker/
-#   docker compose -f docker-compose.yml -f docker-compose.superbase2.yml up -d
+#   sh run.sh config add kong superbase2   # sets COMPOSE_FILE in .env
+#   docker compose up -d
 #
-# On Coolify: set the custom start command to the line above (base directory: docker/).
-# This keeps docker-compose.yml 100% unmodified upstream — only this file changes.
+# superbase2/install.sh does both. This keeps docker-compose.yml 100%
+# unmodified upstream — only this file changes. Coolify can't layer files;
+# it uses the pre-merged docker-compose.coolify.yml instead.
 #
 # This overlay:
 # 1. Uses the pre-built SuperBase² Studio image from ghcr.io
@@ -13,9 +16,10 @@
 # 2. Enables SuperBase² in Studio so the middleware activates
 # 3. Bind-mounts the shared projects manifest so the CLI and Studio share state
 # 4. Adds a one-shot init container that ensures the manifest file exists on first boot
+# 5. Points Kong at the per-project routes written by `superbase2.sh rebuild-kong`
 #
-# The image is built automatically by CI on every push to master.
-# To build locally instead, see the commented-out build: block below.
+# The image is built by CI on every push to master (:latest) and development
+# (:development). To build locally instead, see the commented-out build: block below.
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Health check & robustness overrides for upstream services.
@@ -23,24 +27,18 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 services:
-  kong:
-    healthcheck:
-      # Readiness probe: see docker-compose.coolify.yml for rationale.
-      test: ["CMD-SHELL", "curl -sS -o /dev/null --max-time 5 http://localhost:8000/"]
-      interval: 10s
-      timeout: 6s
-      start_period: 30s
-      retries: 6
-    labels:
-      - coolify.healthcheck.enabled=true
-
-  analytics:
-    healthcheck:
-      test: ["CMD", "curl", "-sSf", "http://localhost:4000/health"]
-      timeout: 10s
-      interval: 10s
-      start_period: 120s
-      retries: 30
+  # Upstream's docker-compose.kong.yml turns `api-gw` into Kong; its entrypoint
+  # renders /home/kong/temp.yml. rebuild-kong writes the base config plus
+  # per-project routes to volumes/api/temp.yml (superbase2-init seeds it from
+  # upstream's kong.yml before the first rebuild), so Kong boots with every
+  # project's routes. The directory is mounted, not the file: rebuild-kong
+  # replaces temp.yml by rename, which a single-file mount would never see.
+  api-gw:
+    volumes: !override
+      - ./volumes/api:/home/kong:ro,z
+    depends_on:
+      superbase2-init:
+        condition: service_completed_successfully
 
   db:
     healthcheck:
@@ -51,7 +49,8 @@ services:
       retries: 10
 
   studio:
-    # Pre-built image from CI (pushed on every merge to master)
+    # Pre-built image from CI: :latest tracks master, :development tracks
+    # development. install.sh sets STUDIO_IMAGE_TAG to match the checkout.
     image: ghcr.io/zbcoding/superbase2-studio:${STUDIO_IMAGE_TAG:-latest}
     # To build from source instead, comment out the image line above and uncomment:
     # build:
@@ -67,7 +66,8 @@ services:
     environment:
       SUPERBASE2_ENABLED: "true"
       SUPERBASE2_MANIFEST: /etc/superbase2/projects.json
-      SUPERBASE2_COMPOSE_CMD: "docker compose -f docker-compose.yml -f docker-compose.superbase2.yml"
+      # Overlay files come from COMPOSE_FILE in docker/.env (see header).
+      SUPERBASE2_COMPOSE_CMD: "docker compose"
       SB2_AGENT_URL: http://sb2-agent:8088
       SB2_AGENT_TOKEN: ${SB2_AGENT_TOKEN}
     volumes:
@@ -84,8 +84,8 @@ services:
   sb2-agent:
     container_name: supabase-sb2-agent
     build:
-      context: ./superbase2/agent
-      dockerfile: Dockerfile
+      context: ./superbase2
+      dockerfile: agent/Dockerfile
     image: superbase2/sb2-agent:local
     # Never attempt a registry pull — this image is always built locally.
     pull_policy: build
@@ -117,6 +117,7 @@ services:
       SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
     volumes:
       - ${SUPERBASE2_DIR:-./superbase2}:/etc/superbase2:z
+      - ./volumes/api:/etc/superbase2-api:z
     entrypoint: /bin/sh
     command:
       - -c
@@ -154,52 +155,8 @@ services:
         fi
         chmod 600 /etc/superbase2/projects.json
 
-  # One-shot init container that injects per-project Kong routes.
-  # The upstream kong-init only writes the base kong.yml (no /project/<ref>/*
-  # paths). Without this, every Coolify redeploy wipes the per-project routes
-  # and all project API calls return 404 until someone manually runs
-  # rebuild-kong. This container runs rebuild-kong on every Kong start so
-  # the routes are always present.
-  kong-sb2-init:
-    image: superbase2/sb2-agent:local
-    # Never attempt a registry pull — this image is always built locally.
-    pull_policy: build
-    build:
-      context: ./superbase2/agent
-      dockerfile: Dockerfile
-    restart: "no"
-    # Disable the sb2-agent image's baked-in HEALTHCHECK (probes :8088, which
-    # this one-shot container never binds). Without this override compose marks
-    # the container `unhealthy` forever and `--wait` aborts the deploy before
-    # kong/functions ever leave `Created`.
-    healthcheck:
-      disable: true
-    depends_on:
-      kong-init:
-        condition: service_completed_successfully
-    environment:
-      # Without this, superbase2.sh defaults STATE_DIR to its own SCRIPT_DIR
-      # and looks for projects under /workspace/superbase2/projects — but the
-      # state volume is mounted one level deeper. The mismatch makes
-      # list_projects return nothing, rebuild-kong writes a base-only config,
-      # and the per-project /project/<ref>/* routes silently disappear on
-      # every restart until rebuild-kong is re-run from sb2-agent (which
-      # does set this env var).
-      SB2_STATE_DIR: /workspace/superbase2/state
-    volumes:
-      - ${DOCKER_SOCKET_LOCATION:-/var/run/docker.sock}:/var/run/docker.sock:z
-      - superbase2-config:/workspace/superbase2/state
-      - kong-config:/workspace/volumes/api
-    entrypoint: /bin/sh
-    command:
-      - -c
-      - |
-        # Wait for Kong to be up so rebuild-kong can restart it
-        echo "[kong-sb2-init] Waiting for Kong to start..."
-        until curl -sS -o /dev/null --max-time 5 http://kong:8000/ 2>/dev/null; do
-          sleep 2
-        done
-        echo "[kong-sb2-init] Kong is up, rebuilding per-project routes..."
-        cd /workspace/superbase2
-        bash superbase2.sh rebuild-kong
-        echo "[kong-sb2-init] Done"
+        if [ ! -s /etc/superbase2-api/temp.yml ]; then
+          cp /etc/superbase2-api/kong.yml /etc/superbase2-api/temp.yml
+          chmod 644 /etc/superbase2-api/temp.yml
+          echo "[SuperBase²] Seeded Kong config from kong.yml (no projects yet)"
+        fi

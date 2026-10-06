@@ -1,0 +1,6 @@
+# Build context for agent/Dockerfile. Only what it COPYs; keeps per-project
+# state (projects/*/.env holds keys) and local notes out of the context.
+*
+!agent/
+!superbase2.sh
+!templates/

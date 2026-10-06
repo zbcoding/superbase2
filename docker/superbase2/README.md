@@ -43,14 +43,18 @@ SuperBase² is designed so that updating Supabase is painless:
 
 - **Zero modifications to existing Supabase files.** Every SuperBase² file is new — new directories, new API routes, new middleware, new compose files. Nothing in the original Supabase codebase is edited.
 - **`git pull` just works.** Because no upstream files are touched, pulling new Supabase releases won't cause merge conflicts. The only theoretical future conflict is if Supabase adds their own `middleware.ts` (they don't have one today) — and that would be a one-time, straightforward merge.
-- **Stock Docker images for all services.** Per-project services (GoTrue, PostgREST, Realtime, Storage, Edge Functions, postgres-meta) use the exact same official Supabase Docker images — no forks, no custom builds. When Supabase releases a new version, pull and restart. The Studio is the one exception: it must be built from this fork's source because the SuperBase² API routes live inside it.
+- **Stock Docker images for all services.** Per-project services (GoTrue, PostgREST, Realtime, Storage, Edge Functions, postgres-meta) use the exact same official Supabase Docker images — no forks, no custom builds. When Supabase releases a new version, pull and restart. The Studio is the one exception: the SuperBase² API routes live inside it, so CI builds it from this fork and publishes `ghcr.io/zbcoding/superbase2-studio` (`:latest` from master, `:development` from development).
 - **Upgrade detection built in.** The `/sb2` dashboard checks Docker Hub for newer image tags and shows a banner when updates are available, along with the exact commands to run.
 
 ```
-# Upgrading (VPS / bare metal):
+# Upgrading (VPS / bare metal). install.sh wrote COMPOSE_FILE to docker/.env,
+# so plain `docker compose` picks up the Kong and SuperBase² overlays.
+# --ignore-buildable skips sb2-agent (built locally); --build rebuilds it
+# from the pulled superbase2/ sources.
 git pull upstream master
-docker compose -f docker-compose.yml -f docker-compose.superbase2.yml pull
-docker compose -f docker-compose.yml -f docker-compose.superbase2.yml up -d
+cd docker
+docker compose pull --ignore-buildable
+docker compose up -d --build
 
 # Upgrading (Coolify): merge upstream, then re-generate the Coolify compose file.
 # See the Coolify section below for details.
@@ -106,8 +110,8 @@ The install script handles everything interactively:
 1. Checks prerequisites (Docker, openssl)
 2. Generates all secrets
 3. Asks for your domain (or defaults to localhost)
-4. Builds the Studio from source (~5–15 min on first run, cached after that)
-5. Pulls all other Docker images
+4. Layers upstream's Kong override and the SuperBase² overlay (`sh run.sh config add kong superbase2`, which writes `COMPOSE_FILE` to `docker/.env`)
+5. Pulls the prebuilt SuperBase² Studio image (`:development` on the development branch, `:latest` otherwise; override with `STUDIO_IMAGE_TAG` in `docker/.env`) and all other images
 6. Starts the shared infrastructure
 7. Optionally creates your first project
 
@@ -205,7 +209,7 @@ git push origin master
 
 Then in Coolify: **Deploy** → Coolify pulls the updated compose file and the latest Studio image from ghcr.io. The init containers re-run on every deploy and are idempotent, so config files and the admin user get refreshed automatically.
 
-**Why a merged file instead of the overlay:** Coolify does not support Docker Compose's multi-file `-f` flag. The `docker-compose.coolify.yml` is a pre-merged copy of `docker-compose.yml` + `docker-compose.superbase2.yml`. The overlay file remains the canonical source for SuperBase² changes.
+**Why a merged file instead of the overlay:** Coolify does not support Docker Compose's multi-file `-f` flag. The `docker-compose.coolify.yml` is a pre-merged copy of `docker-compose.yml` + `docker-compose.superbase2.yml` with Kong as the gateway, plus the init containers above that bake config into volumes. The overlay file remains the canonical source for SuperBase² changes.
 
 **Why base directory is `/docker` and not `/docker/superbase2`:** Coolify reads `.env.example` from the base directory to populate its env var GUI. By pointing at `/docker`, Coolify reads Supabase's upstream `.env.example` directly — so when Supabase adds new variables, they automatically appear in your Coolify GUI without any SuperBase² changes.
 
@@ -414,7 +418,7 @@ SuperBase² adds these files (all new, none modified):
 | `docker/superbase2/agent/` | `sb2-agent` sidecar: Node HTTP service that owns the Docker socket and exposes the project lifecycle / key rotation / Kong rebuild endpoints. Also hosts the baked init configs (`agent/configs/`) so they survive Coolify's ARG_MAX limit. |
 | `docker/superbase2/superbase2.sh` | CLI for creating/managing projects and per-project containers (still works; the agent shells out to it under the hood) |
 | `docker/superbase2/templates/` | Docker Compose and Kong config templates for per-project services |
-| `docker/docker-compose.superbase2.yml` | Overlay that enables SB2 on the Studio container |
+| `docker/docker-compose.superbase2.yml` | Overlay on upstream `docker-compose.yml` + `docker-compose.kong.yml`: SB2 Studio image, `sb2-agent`, `superbase2-init`, and Kong reading per-project routes from `volumes/api/temp.yml` |
 | `docker/docker-compose.coolify.yml` | Pre-merged single compose file for Coolify (base + overlay combined) |
 | `docker/superbase2/docker-compose.standalone.yml` | All-in-one merged file for standalone deployment without the upstream Supabase stack |
 

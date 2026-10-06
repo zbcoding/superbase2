@@ -198,9 +198,35 @@ function runScript(args, extraEnv = {}) {
       resolve({ ok: false, exit_code: -1, stdout, stderr: `${stderr}${err.message}\n` })
     })
     child.on('close', (code) => {
+      restoreStateOwnership()
       resolve({ ok: code === 0, exit_code: code ?? -1, stdout, stderr })
     })
   })
+}
+
+// The agent runs as root. In the standalone layout STATE_DIR is a bind mount
+// of the host checkout, so files the script creates or rewrites there (the
+// manifest, projects/<name>/.env at mode 600) would become root-owned and
+// unreadable to the host user's `./superbase2.sh`. Hand them back to whoever
+// owns STATE_DIR. On Coolify STATE_DIR is a root-owned volume: no-op.
+function restoreStateOwnership() {
+  if (process.getuid() !== 0) return
+  let owner
+  try {
+    owner = fs.statSync(STATE_DIR)
+  } catch {
+    return
+  }
+  if (owner.uid === 0) return
+  const paths = ['projects', 'projects.json', 'projects.json.lock']
+    .map((p) => `${STATE_DIR}/${p}`)
+    .filter((p) => fs.existsSync(p))
+  if (paths.length === 0) return
+  try {
+    execFileSync('chown', ['-R', `${owner.uid}:${owner.gid}`, ...paths])
+  } catch (err) {
+    console.error('[sb2-agent] restoring state ownership failed:', err.message)
+  }
 }
 
 function authorized(req) {
@@ -303,17 +329,23 @@ const server = http.createServer(async (req, res) => {
 // rebuild-kong. This guard checks periodically that every project on disk has
 // its routes in Kong's live config, rebuilding if any are missing.
 
+// Kong is the `kong` service in docker-compose.coolify.yml and the `api-gw`
+// service (via upstream's docker-compose.kong.yml) in the standalone overlay.
 function getKongContainerName() {
-  const args = ['ps', '--filter', 'label=com.docker.compose.service=kong']
-  // Scope to this stack so another stack's `kong` service is never picked up.
-  if (OWN_PROJECT) args.push('--filter', `label=com.docker.compose.project=${OWN_PROJECT}`)
-  args.push('--format', '{{.Names}}')
-  try {
-    const raw = execFileSync('docker', args, { encoding: 'utf8' })
-    return raw.split('\n').map((s) => s.trim()).find(Boolean) || null
-  } catch {
-    return null
+  for (const service of ['kong', 'api-gw']) {
+    const args = ['ps', '--filter', `label=com.docker.compose.service=${service}`]
+    // Scope to this stack so another stack's gateway is never picked up.
+    if (OWN_PROJECT) args.push('--filter', `label=com.docker.compose.project=${OWN_PROJECT}`)
+    args.push('--format', '{{.Names}}')
+    try {
+      const raw = execFileSync('docker', args, { encoding: 'utf8' })
+      const name = raw.split('\n').map((s) => s.trim()).find(Boolean)
+      if (name) return name
+    } catch {
+      // Docker unavailable: no container under either name.
+    }
   }
+  return null
 }
 
 // Projects this agent manages: those with a .env under STATE_DIR/projects

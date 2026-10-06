@@ -131,6 +131,9 @@ services:
       DB_AFTER_CONNECT_QUERY: 'SET search_path TO _realtime'
       DB_ENC_KEY: ${PROJECT_DB_ENC_KEY}
       API_JWT_SECRET: ${PROJECT_JWT_SECRET}
+      # Required (fetch_env!) by upstream's current Realtime (v2.134.10);
+      # the older v2.76.5 pin ignores it.
+      METRICS_JWT_SECRET: ${PROJECT_JWT_SECRET}
       SECRET_KEY_BASE: ${PROJECT_SECRET_KEY_BASE}
       ERL_AFLAGS: -proto_dist inet_tcp
       DNS_NODES: "''"

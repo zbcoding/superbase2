@@ -43,14 +43,27 @@ if ! command -v jq &>/dev/null; then
     exit 1
 fi
 
-# Source the main .env for shared config. Only present when the script runs
-# on the host — in the sb2-agent container the shared creds come in through
-# the container environment (set in the compose file), so we skip this.
+# Load the main .env for shared config. Present when the script runs on the
+# host, and in the standalone sb2-agent (which mounts docker/ at /workspace);
+# on Coolify the shared creds come in through the container environment.
+# It's compose dotenv, not shell: upstream ships unquoted values with spaces
+# (STUDIO_DEFAULT_ORGANIZATION=Default Organization), so parse KEY=VALUE
+# lines and strip one pair of surrounding quotes instead of sourcing it.
+load_dotenv() {
+    local line key value
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        [[ $line =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+        key=${BASH_REMATCH[2]}
+        value=${BASH_REMATCH[3]}
+        if [[ $value =~ ^\"(.*)\"[[:space:]]*$ || $value =~ ^\'(.*)\'[[:space:]]*$ ]]; then
+            value=${BASH_REMATCH[1]}
+        fi
+        export "$key=$value"
+    done < "$1"
+}
 if [ -f "$DOCKER_DIR/.env" ]; then
-    set -a
-    # shellcheck disable=SC1091
-    source "$DOCKER_DIR/.env"
-    set +a
+    load_dotenv "$DOCKER_DIR/.env"
 fi
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -109,6 +122,16 @@ db_container() {
     found=$(service_container db supabase-db)
     # Fallback: literal name used by the standalone (non-Coolify) layout.
     echo "${found:-supabase-db}"
+}
+
+# Kong is the `kong` service in docker-compose.coolify.yml, but upstream's
+# docker-compose.kong.yml (used by the standalone overlay) turns `api-gw` into
+# Kong, container `supabase-kong`.
+kong_container() {
+    local found
+    found=$(service_container kong supabase-kong)
+    [ -n "$found" ] || found=$(service_container api-gw supabase-kong)
+    echo "$found"
 }
 
 # Serialize every state-changing command (create, destroy, up, down,
@@ -2272,7 +2295,7 @@ EOF
     chmod 644 "$kong_temp"
 
     local kong_ctr
-    kong_ctr=$(service_container kong supabase-kong)
+    kong_ctr=$(kong_container)
 
     if [ -z "$kong_ctr" ]; then
         echo "Warning: Kong container not found, skipping reload"

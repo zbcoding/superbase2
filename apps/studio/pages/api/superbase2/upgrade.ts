@@ -109,9 +109,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(405).json({ error: { message: `Method ${req.method} Not Allowed` } })
   }
 
-  const composeCmd =
-    process.env.SUPERBASE2_COMPOSE_CMD ||
-    'docker compose -f docker-compose.yml -f docker-compose.superbase2.yml'
+  // The standalone overlay layers its compose files via COMPOSE_FILE in .env.
+  const composeCmd = process.env.SUPERBASE2_COMPOSE_CMD || 'docker compose'
 
   // Coolify generates the compose file on every deploy and stores it outside the
   // container, so the git-pull + `docker compose up` steps are wrong there: the
@@ -160,7 +159,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     services: results.sort((a, b) => a.service.localeCompare(b.service)),
     upgradeInstructions:
       hasUpdates && !isCoolifyDeployment
-        ? ['git pull upstream master', `${composeCmd} pull`, `${composeCmd} up -d`]
+        ? [
+            'git pull upstream master',
+            `${composeCmd} pull --ignore-buildable`,
+            `${composeCmd} up -d --build`,
+          ]
         : null,
     // Rendered as prose, not as a copyable command block — on Coolify the upgrade
     // is a button in its UI, so there is nothing to paste into a shell. The tags
