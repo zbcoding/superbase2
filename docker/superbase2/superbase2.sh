@@ -1497,16 +1497,21 @@ _ensure_disk_state() {
         exit 1
     fi
 
-    # Always update SUPABASE_NETWORK_NAME in the .env if the runtime
-    # environment has a different value (e.g. agent resolved a Coolify
-    # UUID-prefixed network that wasn't known when the project was created).
-    if [ -f "$project_dir/.env" ] && [ -n "${SUPABASE_NETWORK_NAME:-}" ]; then
-        local current_net
-        current_net=$(grep "^SUPABASE_NETWORK_NAME=" "$project_dir/.env" | cut -d= -f2-)
-        if [ "$current_net" != "$SUPABASE_NETWORK_NAME" ]; then
-            sed -i "s|^SUPABASE_NETWORK_NAME=.*|SUPABASE_NETWORK_NAME=$SUPABASE_NETWORK_NAME|" "$project_dir/.env"
-            echo "Updated SUPABASE_NETWORK_NAME: $current_net -> $SUPABASE_NETWORK_NAME"
-        fi
+    # Stack-wide values copied into the project .env go stale when the stack
+    # changes them (a new domain set in Coolify, a Coolify UUID-prefixed
+    # network unknown when the project was created). Compose prefers the
+    # running environment anyway; this keeps the file, and what client-config
+    # prints from it, in line.
+    if [ -f "$project_dir/.env" ]; then
+        local key current
+        for key in SUPABASE_NETWORK_NAME SUPABASE_PUBLIC_URL; do
+            [ -n "${!key:-}" ] || continue
+            current=$(grep "^$key=" "$project_dir/.env" | cut -d= -f2- || true)
+            if [ "$current" != "${!key}" ]; then
+                _set_env_var "$project_dir/.env" "$key" "${!key}"
+                echo "Updated $key: $current -> ${!key}"
+            fi
+        done
     fi
 
     # Always regenerate the compose file from template before starting.
@@ -1753,9 +1758,11 @@ cmd_client_config() {
     fi
 
     local project_dir="$PROJECTS_DIR/$name"
+    # The stack's current public URL wins over the copy in the project .env,
+    # which is only refreshed when the project starts.
+    local public_url="${SUPABASE_PUBLIC_URL:-}"
     load_dotenv "$project_dir/.env"
-
-    local public_url="${SUPABASE_PUBLIC_URL:-http://localhost:8000}"
+    public_url="${public_url:-${SUPABASE_PUBLIC_URL:-http://localhost:8000}}"
 
     echo ""
     echo "=== Client Configuration for '$name' ==="
