@@ -44,8 +44,9 @@ if ! command -v jq &>/dev/null; then
 fi
 
 # Load the main .env for shared config. Present when the script runs on the
-# host, and in the standalone sb2-agent (which mounts docker/ at /workspace);
-# on Coolify the shared creds come in through the container environment.
+# host, and in the overlay's sb2-agent (which mounts docker/ at /workspace);
+# on Coolify and standalone the shared creds come in through the container
+# environment.
 # It's compose dotenv, not shell: upstream ships unquoted values with spaces
 # (STUDIO_DEFAULT_ORGANIZATION=Default Organization), so parse KEY=VALUE
 # lines and strip one pair of surrounding quotes instead of sourcing it.
@@ -159,6 +160,60 @@ install_kong_config() {
         chmod 644 "$staged"
     fi
     mv -f "$staged" "$dest"
+}
+
+# Each project's edge functions run user code, so they get their own network
+# (sb2-fn-<name>) instead of the shared stack network, where they could reach
+# every project's unauthenticated pg-meta, the main pg-meta (supabase_admin),
+# Studio and this agent. Only Kong (alias `kong`, the functions' SUPABASE_URL
+# host) and Postgres (alias $POSTGRES_HOST) join it. The network is external
+# to the project's compose file, so `down` leaves it; destroy removes it.
+#
+# Recreated containers (a Coolify redeploy) lose the attachment, so this runs
+# on every start, every rebuild-kong and the agent's periodic check
+# (connect-networks). Idempotent.
+_connect_functions_network() {
+    local net="sb2-fn-$1" kong_ctr db_ctr db_alias="${POSTGRES_HOST:-db}"
+    if ! docker network inspect "$net" >/dev/null 2>&1; then
+        # A concurrent run may have just created it.
+        docker network create "$net" >/dev/null 2>&1 || docker network inspect "$net" >/dev/null
+    fi
+    kong_ctr=$(kong_container)
+    db_ctr=$(db_container)
+    # An IP POSTGRES_HOST is reached by routing, not by name.
+    [[ "$db_alias" =~ ^[0-9.]+$|: ]] && db_alias=""
+    _attach_to_network "$net" "$kong_ctr" kong
+    _attach_to_network "$net" "$db_ctr" "$db_alias"
+}
+
+_attach_to_network() {
+    local net="$1" ctr="$2" alias="$3"
+    if [ -z "$ctr" ] || ! docker inspect "$ctr" >/dev/null 2>&1; then
+        echo "Warning: no running container to attach to $net${alias:+ as $alias}" >&2
+        return 0
+    fi
+    if [ "$(docker inspect -f "{{if index .NetworkSettings.Networks \"$net\"}}yes{{end}}" "$ctr" 2>/dev/null)" = yes ]; then
+        return 0
+    fi
+    docker network connect ${alias:+--alias "$alias"} "$net" "$ctr" >/dev/null 2>&1 \
+        || echo "Warning: failed to attach $ctr to $net" >&2
+}
+
+cmd_connect_networks() {
+    local proj
+    for proj in $(list_projects); do
+        docker network inspect "sb2-fn-$proj" >/dev/null 2>&1 && _connect_functions_network "$proj"
+    done
+    return 0
+}
+
+_remove_functions_network() {
+    local net="sb2-fn-$1" ctr
+    docker network inspect "$net" >/dev/null 2>&1 || return 0
+    for ctr in $(docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}' "$net"); do
+        docker network disconnect -f "$net" "$ctr" >/dev/null 2>&1 || true
+    done
+    docker network rm "$net" >/dev/null 2>&1 || echo "Warning: failed to remove network $net"
 }
 
 # Serialize every state-changing command (create, destroy, up, down,
@@ -482,13 +537,15 @@ list_projects() {
 cmd_create() {
     local name="$1"
 
-    # Validate project name: only alphanumeric; 2-48 chars.
+    # Validate project name: lowercase letters and digits; 2-48 chars.
+    # No uppercase — Docker Compose rejects it in the project name (supabase-<name>),
+    # so the project could be created but never started.
     # No underscores — Docker DNS does not support them in service hostnames (RFC 1123),
     # which would break per-project container resolution (e.g. meta-<name>).
     # No hyphens — reserved for future use and avoided for DB name safety.
-    if [[ ! "$name" =~ ^[a-zA-Z0-9]+$ ]]; then
+    if [[ ! "$name" =~ ^[a-z0-9]+$ ]]; then
         echo "Error: Invalid project name '$name'."
-        echo "Project names may only contain letters and numbers (no underscores or hyphens)."
+        echo "Project names may only contain lowercase letters and numbers (no underscores or hyphens)."
         exit 1
     fi
 
@@ -542,7 +599,10 @@ cmd_create() {
     # Hex so it needs no escaping in a connection string or in DDL.
     db_password=$(gen_hex 24)
 
-    # Write project .env
+    # Write project .env. It holds the project's JWT secret and DB password:
+    # restrict it before any secret is written.
+    : > "$project_dir/.env"
+    chmod 600 "$project_dir/.env"
     cat > "$project_dir/.env" <<EOF
 # Project: $name
 # Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -572,7 +632,6 @@ JWT_EXPIRY=${JWT_EXPIRY:-3600}
 
 # URLs
 SUPABASE_PUBLIC_URL=${SUPABASE_PUBLIC_URL:-http://localhost:8000}
-API_EXTERNAL_URL=${API_EXTERNAL_URL:-http://localhost:8000}
 SITE_URL=${SITE_URL:-http://localhost:3000}
 ADDITIONAL_REDIRECT_URLS=${ADDITIONAL_REDIRECT_URLS:-}
 
@@ -589,10 +648,6 @@ SMTP_PORT=${SMTP_PORT:-2500}
 SMTP_USER=${SMTP_USER:-fake_mail_user}
 SMTP_PASS=${SMTP_PASS:-fake_mail_password}
 SMTP_SENDER_NAME=${SMTP_SENDER_NAME:-fake_sender}
-MAILER_URLPATHS_CONFIRMATION=${MAILER_URLPATHS_CONFIRMATION:-/auth/v1/verify}
-MAILER_URLPATHS_INVITE=${MAILER_URLPATHS_INVITE:-/auth/v1/verify}
-MAILER_URLPATHS_RECOVERY=${MAILER_URLPATHS_RECOVERY:-/auth/v1/verify}
-MAILER_URLPATHS_EMAIL_CHANGE=${MAILER_URLPATHS_EMAIL_CHANGE:-/auth/v1/verify}
 
 # Storage
 GLOBAL_S3_BUCKET=${GLOBAL_S3_BUCKET:-stub}
@@ -679,6 +734,11 @@ END
 -- project must not reach outside its own database. Read access to the
 -- service-managed schemas is granted per-database instead.
 ALTER ROLE "$role" SET search_path TO "\$user", public, extensions;
+-- Marks the role for the login trigger that keeps it out of the main stack's
+-- databases (_block_project_roles_in_main_dbs). The group holds no privileges.
+SELECT 'CREATE ROLE sb2_project_login NOLOGIN'
+ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sb2_project_login') \gexec
+GRANT sb2_project_login TO "$role";
 EOSQL
 }
 
@@ -778,10 +838,16 @@ SELECT 'CREATE ROLE supabase_realtime_admin WITH NOINHERIT NOLOGIN NOREPLICATION
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supabase_realtime_admin') \gexec
 GRANT supabase_realtime_admin TO postgres;
 SELECT format('GRANT supabase_realtime_admin TO %I', :'rt') \gexec
--- Marks the role for the login trigger installed by _block_realtime_roles_in_main_dbs.
+-- Mark both project roles for the login trigger installed by
+-- _block_project_roles_in_main_dbs. The groups hold no privileges. The login
+-- role is normally marked at creation; this repairs older projects.
 SELECT 'CREATE ROLE sb2_project_realtime NOLOGIN'
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sb2_project_realtime') \gexec
 SELECT format('GRANT sb2_project_realtime TO %I WITH INHERIT FALSE, SET FALSE', :'rt') \gexec
+SELECT 'CREATE ROLE sb2_project_login NOLOGIN'
+ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sb2_project_login') \gexec
+SELECT format('GRANT sb2_project_login TO %I', :'db')
+ WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'db') \gexec
 
 \c :db
 -- CONNECT to log in; CREATE because PG15+ needs it for CREATE PUBLICATION.
@@ -907,7 +973,10 @@ END $$;
 EOSQL
 
     if [ "$version" -ge 170000 ]; then
-        _block_realtime_roles_in_main_dbs "$db_ctr"
+        _block_project_roles_in_main_dbs "$db_ctr"
+    else
+        echo "WARNING: PostgreSQL server_version_num=$version (< 170000): no login event triggers, so the"
+        echo "         database roles of '$name' can still log in to the main 'postgres' database. Upgrade to PostgreSQL 17+."
     fi
 
     _set_env_var "$env_file" PROJECT_REALTIME_DB_USER "$rt_user"
@@ -915,21 +984,23 @@ EOSQL
     _set_env_var "$env_file" PROJECT_REALTIME_SLOT_SUFFIX "$slot_suffix"
 }
 
-# Keep project Realtime roles out of the main stack's databases.
+# Keep project database roles out of the main stack's databases.
 #
-# PUBLIC holds CONNECT on `postgres` and `_supabase`, so a <db>_rt role could
-# log in there, SET ROLE service_role (it may, for RLS checks in its own
-# database) and read or write the main project's data, or open a logical
-# replication slot and stream its changes. A login event trigger (PostgreSQL
-# 17+) refuses members of sb2_project_realtime, including replication
-# connections. Revoking CONNECT from PUBLIC instead would cut off every role
-# the main stack and its users rely on.
+# PUBLIC holds CONNECT on `postgres` and `_supabase`. There, a project's login
+# role (the DATABASE_URL user) could read the main JWT secret from the
+# app.settings.jwt_secret GUC and forge main-stack service_role tokens, and a
+# <db>_rt role could SET ROLE service_role (it may, for RLS checks in its own
+# database) or open a logical replication slot on the main data. A login
+# event trigger (PostgreSQL 17+) refuses members of sb2_project_login and
+# sb2_project_realtime, including replication connections. Revoking CONNECT
+# from PUBLIC instead would cut off every role the main stack and its users
+# rely on.
 #
 # A login trigger that errors locks everyone out (recovery: start Postgres
 # with -c event_triggers=off), so the membership check cannot fail: it joins
 # on names and swallows errors. template1 is left alone, or every database
-# created from it would refuse its own project's Realtime role.
-_block_realtime_roles_in_main_dbs() {
+# created from it would refuse its own project's roles.
+_block_project_roles_in_main_dbs() {
     local db_ctr="$1" main_db
     for main_db in postgres _supabase; do
         if ! docker exec "$db_ctr" psql -U supabase_admin -d postgres -tAc \
@@ -938,7 +1009,7 @@ _block_realtime_roles_in_main_dbs() {
         fi
         docker exec -i "$db_ctr" psql -U supabase_admin -d "$main_db" -q -v ON_ERROR_STOP=1 <<'EOSQL'
 CREATE SCHEMA IF NOT EXISTS extensions;
-CREATE OR REPLACE FUNCTION extensions.sb2_block_project_realtime()
+CREATE OR REPLACE FUNCTION extensions.sb2_block_project_roles()
  RETURNS event_trigger
  LANGUAGE plpgsql
  SET search_path = pg_catalog
@@ -951,18 +1022,22 @@ BEGIN
       SELECT 1 FROM pg_auth_members m
       JOIN pg_roles g ON g.oid = m.roleid
       JOIN pg_roles u ON u.oid = m.member
-      WHERE g.rolname = 'sb2_project_realtime' AND u.rolname = session_user)
+      WHERE g.rolname IN ('sb2_project_login', 'sb2_project_realtime')
+        AND u.rolname = session_user)
     INTO blocked;
   EXCEPTION WHEN OTHERS THEN
     blocked := false;
   END;
   IF blocked THEN
-    RAISE EXCEPTION 'role "%" is a project Realtime role and may only connect to its project database', session_user;
+    RAISE EXCEPTION 'role "%" belongs to a SuperBase² project and may only connect to its project database', session_user;
   END IF;
 END;
 $fn$;
-SELECT 'CREATE EVENT TRIGGER sb2_block_project_realtime ON login EXECUTE FUNCTION extensions.sb2_block_project_realtime()'
- WHERE NOT EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = 'sb2_block_project_realtime') \gexec
+SELECT 'CREATE EVENT TRIGGER sb2_block_project_roles ON login EXECUTE FUNCTION extensions.sb2_block_project_roles()'
+ WHERE NOT EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = 'sb2_block_project_roles') \gexec
+-- Superseded by sb2_block_project_roles, which also covers the login roles.
+DROP EVENT TRIGGER IF EXISTS sb2_block_project_realtime;
+DROP FUNCTION IF EXISTS extensions.sb2_block_project_realtime();
 EOSQL
     done
 }
@@ -1192,10 +1267,9 @@ cmd_destroy() {
 
     local project_dir="$PROJECTS_DIR/$name"
 
-    # Load project env
-    set -a
-    source "$project_dir/.env"
-    set +a
+    # Load project env. It's compose dotenv, not shell: values like SMTP_PASS
+    # may hold spaces or $(), so parse instead of sourcing.
+    load_dotenv "$project_dir/.env"
 
     # Stop containers
     echo "Stopping project containers..."
@@ -1228,6 +1302,8 @@ cmd_destroy() {
             echo "Warning: Failed to drop role '${rt_role}'. It may need manual cleanup."
         fi
     fi
+
+    _remove_functions_network "$name"
 
     # Remove project directory
     rm -rf "$project_dir"
@@ -1461,6 +1537,10 @@ _start_project() {
     # starts, and its credentials land in the .env compose reads below.
     _ensure_realtime_db "$name"
 
+    # The functions network is external to the compose file; it must exist
+    # before `up`, with Kong and Postgres on it.
+    _connect_functions_network "$name"
+
     # --remove-orphans: a service disabled since the last start (and its
     # companions, e.g. imgproxy for storage) is gone from the regenerated
     # compose file, so stop it instead of leaving it running.
@@ -1518,7 +1598,9 @@ _generate_disk_state_from_manifest() {
         _ensure_project_db_role "$db" "$db_password"
     fi
 
-    # Write .env
+    # Write .env, restricted before any secret is written (see cmd_create).
+    : > "$project_dir/.env"
+    chmod 600 "$project_dir/.env"
     cat > "$project_dir/.env" <<EOF
 # Project: $name
 # Generated: ${created_at:-$(date -u +"%Y-%m-%dT%H:%M:%SZ")}
@@ -1548,7 +1630,6 @@ JWT_EXPIRY=${JWT_EXPIRY:-3600}
 
 # URLs
 SUPABASE_PUBLIC_URL=${SUPABASE_PUBLIC_URL:-http://localhost:8000}
-API_EXTERNAL_URL=${API_EXTERNAL_URL:-http://localhost:8000}
 SITE_URL=${SITE_URL:-http://localhost:3000}
 ADDITIONAL_REDIRECT_URLS=${ADDITIONAL_REDIRECT_URLS:-}
 
@@ -1565,10 +1646,6 @@ SMTP_PORT=${SMTP_PORT:-2500}
 SMTP_USER=${SMTP_USER:-fake_mail_user}
 SMTP_PASS=${SMTP_PASS:-fake_mail_password}
 SMTP_SENDER_NAME=${SMTP_SENDER_NAME:-fake_sender}
-MAILER_URLPATHS_CONFIRMATION=${MAILER_URLPATHS_CONFIRMATION:-/auth/v1/verify}
-MAILER_URLPATHS_INVITE=${MAILER_URLPATHS_INVITE:-/auth/v1/verify}
-MAILER_URLPATHS_RECOVERY=${MAILER_URLPATHS_RECOVERY:-/auth/v1/verify}
-MAILER_URLPATHS_EMAIL_CHANGE=${MAILER_URLPATHS_EMAIL_CHANGE:-/auth/v1/verify}
 
 # Storage
 GLOBAL_S3_BUCKET=${GLOBAL_S3_BUCKET:-stub}
@@ -1676,9 +1753,7 @@ cmd_client_config() {
     fi
 
     local project_dir="$PROJECTS_DIR/$name"
-    set -a
-    source "$project_dir/.env"
-    set +a
+    load_dotenv "$project_dir/.env"
 
     local public_url="${SUPABASE_PUBLIC_URL:-http://localhost:8000}"
 
@@ -2090,6 +2165,24 @@ cmd_rebuild_kong() {
           - /project/${ref}/auth/v1/authorize
     plugins:
       - name: cors
+  - name: auth-v1-open-sso-acs-${proj}
+    url: http://auth-${proj}:9999/sso/saml/acs
+    routes:
+      - name: auth-v1-open-sso-acs-${proj}
+        strip_path: true
+        paths:
+          - /project/${ref}/auth/v1/sso/saml/acs
+    plugins:
+      - name: cors
+  - name: auth-v1-open-sso-metadata-${proj}
+    url: http://auth-${proj}:9999/sso/saml/metadata
+    routes:
+      - name: auth-v1-open-sso-metadata-${proj}
+        strip_path: true
+        paths:
+          - /project/${ref}/auth/v1/sso/saml/metadata
+    plugins:
+      - name: cors
   - name: auth-v1-${proj}
     url: http://auth-${proj}:9999/
     routes:
@@ -2118,6 +2211,31 @@ cmd_rebuild_kong() {
             - anon-${proj}
 
   ## REST routes for $proj
+  ## OpenAPI root: this project's service_role key only, as in the base config
+  - name: rest-v1-openapi-${proj}
+    url: http://rest-${proj}:3000/
+    routes:
+      - name: rest-v1-openapi-root-${proj}
+        strip_path: true
+        expression: 'http.path == "/project/${ref}/rest/v1/"'
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: false
+      - name: request-transformer
+        config:
+          add:
+            headers:
+              - "Authorization: \$LUA_AUTH_EXPR"
+          replace:
+            headers:
+              - "Authorization: \$LUA_AUTH_EXPR"
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin-${proj}
   - name: rest-v1-${proj}
     url: http://rest-${proj}:3000/
     routes:
@@ -2202,6 +2320,34 @@ cmd_rebuild_kong() {
           allow:
             - admin-${proj}
             - anon-${proj}
+  # Realtime's tenant-admin API accepts any token signed with the project's
+  # JWT secret, including the public anon key: blocked, as in the base config.
+  - name: realtime-v1-rest-openapi-${proj}
+    url: http://realtime-${proj}.supabase-realtime:4000/api/openapi
+    protocol: http
+    routes:
+      - name: realtime-v1-rest-openapi-${proj}
+        strip_path: true
+        paths:
+          - /project/${ref}/realtime/v1/api/openapi
+    plugins:
+      - name: request-termination
+        config:
+          status_code: 403
+          message: "Access is forbidden."
+  - name: realtime-v1-rest-tenants-${proj}
+    url: http://realtime-${proj}.supabase-realtime:4000/api/tenants
+    protocol: http
+    routes:
+      - name: realtime-v1-rest-tenants-${proj}
+        strip_path: true
+        paths:
+          - /project/${ref}/realtime/v1/api/tenants
+    plugins:
+      - name: request-termination
+        config:
+          status_code: 403
+          message: "Access is forbidden."
   - name: realtime-v1-rest-${proj}
     url: http://realtime-${proj}.supabase-realtime:4000/api
     protocol: http
@@ -2260,7 +2406,8 @@ cmd_rebuild_kong() {
   ## Functions routes for $proj
   - name: functions-v1-${proj}
     url: http://functions-${proj}:9000/
-    read_timeout: 150000
+    # Limit inactivity between reads, leaving 10s for the runtime's 150s idle timeout.
+    read_timeout: 160000
     routes:
       - name: functions-v1-all-${proj}
         strip_path: true
@@ -2268,6 +2415,13 @@ cmd_rebuild_kong() {
           - /project/${ref}/functions/v1/
     plugins:
       - name: cors
+      # Projects have no sb_ keys to translate; just drop a client-supplied
+      # sb-api-key so it can't pose as one Kong set (base config anti-spoof).
+      - name: request-transformer
+        config:
+          remove:
+            headers:
+              - "sb-api-key"
 
   ## pg-meta routes for $proj
   - name: meta-${proj}
@@ -2328,6 +2482,9 @@ EOF
         echo "Kong configuration written to $kong_temp"
         return 0
     fi
+
+    # A recreated Kong (or Postgres) has dropped off the functions networks.
+    cmd_connect_networks
 
     echo "Resolving placeholders and writing config to Kong..."
     # Pipe temp.yml through awk INSIDE the Kong container. ENVIRON in awk picks
@@ -2531,6 +2688,7 @@ usage() {
     echo "  rotate-keys <name>    Rotate JWT secret + anon/service_role keys + database password (restarts containers)"
     echo "  migrate-db-owner <name>  Give a pre-existing project its own database role (one-time backfill)"
     echo "  verify [name]        Check container JWT secrets match manifest"
+    echo "  connect-networks      Re-attach Kong and Postgres to every project's functions network"
 }
 
 # State-changing commands run one at a time (see acquire_state_lock).
@@ -2591,6 +2749,9 @@ case "${1:-}" in
         ;;
     verify)
         cmd_verify "${2:-}"
+        ;;
+    connect-networks)
+        cmd_connect_networks
         ;;
     *)
         usage

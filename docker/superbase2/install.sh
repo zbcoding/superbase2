@@ -41,6 +41,10 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --project)
+            if [ $# -lt 2 ]; then
+                err "--project requires a name"
+                exit 1
+            fi
             FIRST_PROJECT="$2"
             AUTO=true
             shift 2

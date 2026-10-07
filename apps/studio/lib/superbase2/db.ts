@@ -105,6 +105,14 @@ export async function createProjectRole(roleName: string, password: string): Pro
   // but roles and databases are cluster-global and a project must not reach
   // outside its own database.
   await pool.query(`ALTER ROLE "${roleName}" SET search_path TO "$user", public, extensions`)
+  // Marks the role for superbase2.sh's login trigger, which keeps project roles
+  // out of the main stack's databases. The group holds no privileges.
+  await pool.query(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sb2_project_login') THEN
+      CREATE ROLE sb2_project_login NOLOGIN;
+    END IF;
+  END $$`)
+  await pool.query(`GRANT sb2_project_login TO "${roleName}"`)
 }
 
 export async function createProjectDatabase(
@@ -278,12 +286,14 @@ export async function createProjectDatabase(
 }
 
 /** Validate that a project name is safe for use in identifiers and file paths.
- *  Only alphanumeric characters allowed — no hyphens, no underscores.
+ *  Only lowercase letters and digits — no uppercase, hyphens or underscores.
+ *  Uppercase is excluded because Docker Compose rejects it in project names
+ *  (supabase-<name>), so such a project could be created but never started.
  *  Underscores are excluded because Docker DNS does not support them in hostnames
  *  (RFC 1123), which would break per-project container resolution (e.g. meta-<name>).
  *  Keep in sync with superbase2.sh cmd_create validation. */
 export function isValidProjectName(name: string): boolean {
-  return /^[a-zA-Z0-9]+$/.test(name) && name.length >= 2 && name.length <= MAX_PROJECT_NAME_LENGTH
+  return /^[a-z0-9]+$/.test(name) && name.length >= 2 && name.length <= MAX_PROJECT_NAME_LENGTH
 }
 
 export async function dropProjectDatabase(dbName: string): Promise<void> {

@@ -1076,10 +1076,10 @@ export default function SB2Dashboard() {
                 id="sb2-project-name"
                 type="text"
                 value={newName}
-                onChange={(e) => setNewName(e.target.value.replace(/[^a-zA-Z0-9]/g, ''))}
-                placeholder="Project name (letters and numbers only)"
-                pattern="^[a-zA-Z0-9]{2,48}$"
-                title="Only letters and numbers (2-48 chars). No hyphens or underscores."
+                onChange={(e) => setNewName(e.target.value.toLowerCase().replace(/[^a-z0-9]/g, ''))}
+                placeholder="Project name (lowercase letters and numbers only)"
+                pattern="^[a-z0-9]{2,48}$"
+                title="Only lowercase letters and numbers (2-48 chars). No hyphens or underscores."
                 style={styles.input}
                 disabled={creating}
                 minLength={2}
@@ -1100,8 +1100,8 @@ export default function SB2Dashboard() {
               </p>
             )}
             <p id="sb2-project-hint" style={styles.hint}>
-              Creates the database and secrets. Only letters and numbers allowed (no underscores or
-              hyphens — required for Docker DNS). After creation, click{' '}
+              Creates the database and secrets. Only lowercase letters and numbers allowed (no
+              underscores or hyphens — required by Docker). After creation, click{' '}
               <strong style={{ color: SB2_ACCENT }}>Start</strong> on the project card to boot the
               per-project containers.
             </p>

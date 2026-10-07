@@ -68,7 +68,7 @@ async function handleCreate(req: NextApiRequest, res: NextApiResponse) {
       return res.status(400).json({
         error: {
           message:
-            'Invalid project name. Only letters and numbers are allowed (2-48 chars). No underscores or hyphens.',
+            'Invalid project name. Only lowercase letters and numbers are allowed (2-48 chars). No underscores or hyphens.',
         },
       })
     }

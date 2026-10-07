@@ -413,6 +413,16 @@ async function ensureKongRoutes() {
   }
 }
 
+// Kong and Postgres drop off the per-project functions networks when they are
+// recreated (a redeploy). rebuild-kong and reconcile re-attach them; this
+// covers a recreate that needed neither.
+async function ensureFunctionsNetworks() {
+  const result = await runScript(['connect-networks'])
+  if (!result.ok) {
+    console.error('[sb2-agent] connect-networks FAILED:', result.stderr || result.stdout)
+  }
+}
+
 // ── Image drift ──────────────────────────────────────────────────────────────
 //
 // Per-project containers run the main stack's images (superbase2.sh exports
@@ -543,6 +553,7 @@ async function periodicCheck() {
       await reconcile(`images differ from the main stack for ${healthy.join(', ')}`, healthy)
     } else {
       await ensureKongRoutes()
+      await ensureFunctionsNetworks()
     }
   } finally {
     checkRunning = false

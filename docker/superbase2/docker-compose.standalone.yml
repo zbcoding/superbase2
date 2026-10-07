@@ -99,9 +99,11 @@ services:
 
   sb2-agent:
     container_name: supabase-sb2-agent
+    # Context is this directory: the Dockerfile copies agent/, superbase2.sh
+    # and templates/ from it.
     build:
-      context: ./agent
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: agent/Dockerfile
     image: superbase2/sb2-agent:local
     # Never attempt a registry pull — this image is always built locally.
     pull_policy: build
@@ -111,12 +113,45 @@ services:
       SB2_AGENT_PORT: 8088
       SB2_DOCKER_DIR: /workspace
       SB2_STATE_DIR: /workspace/superbase2/state
+      # Shared infra settings for the per-project .env files. The agent has no
+      # docker/.env to read, so they come in here (as in docker-compose.coolify.yml).
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: ${POSTGRES_HOST:-db}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      JWT_EXPIRY: ${JWT_EXPIRY:-3600}
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}
+      SITE_URL: ${SITE_URL:-http://localhost:3000}
+      ADDITIONAL_REDIRECT_URLS: ${ADDITIONAL_REDIRECT_URLS:-}
+      DISABLE_SIGNUP: ${DISABLE_SIGNUP:-false}
+      ENABLE_EMAIL_SIGNUP: ${ENABLE_EMAIL_SIGNUP:-true}
+      ENABLE_EMAIL_AUTOCONFIRM: ${ENABLE_EMAIL_AUTOCONFIRM:-false}
+      ENABLE_PHONE_SIGNUP: ${ENABLE_PHONE_SIGNUP:-true}
+      ENABLE_PHONE_AUTOCONFIRM: ${ENABLE_PHONE_AUTOCONFIRM:-true}
+      ENABLE_ANONYMOUS_USERS: ${ENABLE_ANONYMOUS_USERS:-false}
+      SMTP_ADMIN_EMAIL: ${SMTP_ADMIN_EMAIL:-admin@example.com}
+      SMTP_HOST: ${SMTP_HOST:-supabase-mail}
+      SMTP_PORT: ${SMTP_PORT:-2500}
+      SMTP_USER: ${SMTP_USER:-fake_mail_user}
+      SMTP_PASS: ${SMTP_PASS:-fake_mail_password}
+      SMTP_SENDER_NAME: ${SMTP_SENDER_NAME:-fake_sender}
+      GLOBAL_S3_BUCKET: ${GLOBAL_S3_BUCKET:-stub}
+      REGION: ${REGION:-local}
+      IMGPROXY_ENABLE_WEBP_DETECTION: ${IMGPROXY_ENABLE_WEBP_DETECTION:-true}
+      FUNCTIONS_VERIFY_JWT: ${FUNCTIONS_VERIFY_JWT:-true}
+      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS:-public,storage,graphql_public}
+      PGRST_DB_MAX_ROWS: ${PGRST_DB_MAX_ROWS:-1000}
+      PGRST_DB_EXTRA_SEARCH_PATH: ${PGRST_DB_EXTRA_SEARCH_PATH:-public,extensions}
     volumes:
       - ${DOCKER_SOCKET_LOCATION:-/var/run/docker.sock}:/var/run/docker.sock:z
       # Shared state: projects.json + per-project disk dirs. Must live in a
       # named volume so Studio (via /etc/superbase2) and the agent see the
       # same files on Coolify, which rewrites relative bind mounts.
       - superbase2-state:/workspace/superbase2/state
+      # Kong's config: rebuild-kong writes temp.yml here and reloads Kong.
+      - kong-config:/workspace/volumes/api
+    depends_on:
+      kong-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8088/health"]
       interval: 10s
@@ -124,6 +159,30 @@ services:
       retries: 3
     security_opt:
       - "label=disable"
+
+  # Seeds Kong's config volume with the entrypoint and base config baked into
+  # the agent image. The agent's startup reconcile then adds every project's
+  # routes (rebuild-kong).
+  kong-init:
+    image: superbase2/sb2-agent:local
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    restart: "no"
+    # The image's HEALTHCHECK probes :8088, which this one-shot never binds.
+    healthcheck:
+      disable: true
+    volumes:
+      - kong-config:/home/kong
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        cp /opt/sb2-configs/kong/kong-entrypoint.sh /home/kong/kong-entrypoint.sh
+        cp /opt/sb2-configs/kong/temp.yml /home/kong/temp.yml
+        chmod +x /home/kong/kong-entrypoint.sh
+        echo "[kong-init] Config files written"
 
   # ─── Studio (with SuperBase² enabled) ──────────────────────────────────────
 
@@ -226,12 +285,19 @@ services:
     ports:
       - ${KONG_HTTP_PORT:-8000}:8000/tcp
       - ${KONG_HTTPS_PORT:-8443}:8443/tcp
+    depends_on:
+      kong-init:
+        condition: service_completed_successfully
+    # The whole directory, from the volume rebuild-kong writes: a single-file
+    # mount of the repo's kong.yml would drop every project's routes on restart.
     volumes:
-      - ../volumes/api/kong.yml:/home/kong/temp.yml:ro,z
-      - ../volumes/api/kong-entrypoint.sh:/home/kong/kong-entrypoint.sh:ro,z
+      - kong-config:/home/kong:ro
     environment:
       KONG_DATABASE: "off"
       KONG_DECLARATIVE_CONFIG: /usr/local/kong/kong.yml
+      # The base config's rest-v1-openapi-root route uses `expression:`, which
+      # Kong rejects under the default traditional_compatible router.
+      KONG_ROUTER_FLAVOR: expressions
       KONG_DNS_ORDER: LAST,A,CNAME
       KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth,request-termination,ip-restriction,post-function
       KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
@@ -582,3 +648,4 @@ volumes:
   db-config:
   deno-cache:
   superbase2-state:
+  kong-config:

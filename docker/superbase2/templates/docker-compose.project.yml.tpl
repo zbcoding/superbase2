@@ -40,7 +40,9 @@ services:
     environment:
       GOTRUE_API_HOST: 0.0.0.0
       GOTRUE_API_PORT: 9999
-      API_EXTERNAL_URL: ${API_EXTERNAL_URL}
+      # This project's GoTrue sits behind /project/<ref>/auth/v1 on Kong. OAuth
+      # callbacks and SAML ACS URLs are built from this base.
+      API_EXTERNAL_URL: ${SUPABASE_PUBLIC_URL}/project/{{PROJECT_REF}}/auth/v1
 
       GOTRUE_DB_DRIVER: postgres
       GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/{{PROJECT_DB}}
@@ -69,10 +71,12 @@ services:
       GOTRUE_SMTP_USER: ${SMTP_USER:-fake_mail_user}
       GOTRUE_SMTP_PASS: ${SMTP_PASS:-fake_mail_password}
       GOTRUE_SMTP_SENDER_NAME: ${SMTP_SENDER_NAME:-fake_sender}
-      GOTRUE_MAILER_URLPATHS_INVITE: ${MAILER_URLPATHS_INVITE}
-      GOTRUE_MAILER_URLPATHS_CONFIRMATION: ${MAILER_URLPATHS_CONFIRMATION}
-      GOTRUE_MAILER_URLPATHS_RECOVERY: ${MAILER_URLPATHS_RECOVERY}
-      GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: ${MAILER_URLPATHS_EMAIL_CHANGE}
+      # GoTrue resolves these absolute paths against API_EXTERNAL_URL's origin,
+      # dropping its path, so the project prefix has to be spelled out here.
+      GOTRUE_MAILER_URLPATHS_INVITE: /project/{{PROJECT_REF}}/auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_CONFIRMATION: /project/{{PROJECT_REF}}/auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_RECOVERY: /project/{{PROJECT_REF}}/auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: /project/{{PROJECT_REF}}/auth/v1/verify
 
       GOTRUE_EXTERNAL_PHONE_ENABLED: ${ENABLE_PHONE_SIGNUP}
       GOTRUE_SMS_AUTOCONFIRM: ${ENABLE_PHONE_AUTOCONFIRM}
@@ -261,8 +265,11 @@ services:
     image: ${EDGE_RUNTIME_IMAGE:-supabase/edge-runtime:v1.71.2}
     labels: *sb2-labels
     restart: unless-stopped
+    # User code: kept off the shared stack network (see
+    # _connect_functions_network in superbase2.sh). Only Kong and Postgres
+    # are reachable on this one.
     networks:
-      - supabase_default
+      - functions
     depends_on:
       functions-init-{{PROJECT_NAME}}:
         condition: service_completed_successfully
@@ -272,8 +279,8 @@ services:
       JWT_SECRET: ${PROJECT_JWT_SECRET}
       # This project's routes on Kong, not the main stack's: supabase-js clients
       # built from these inside a function must reach this project's services.
-      # `kong` is the gateway's compose service name, which (unlike the
-      # container name) Coolify doesn't rewrite.
+      # `kong` is an alias superbase2.sh gives the gateway on the functions
+      # network (Coolify rewrites container names).
       SUPABASE_URL: http://kong:8000/project/{{PROJECT_REF}}
       SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL}/project/{{PROJECT_REF}}
       SUPABASE_ANON_KEY: ${PROJECT_ANON_KEY}
@@ -291,6 +298,9 @@ networks:
   supabase_default:
     external: true
     name: ${SUPABASE_NETWORK_NAME:-supabase_default}
+  functions:
+    external: true
+    name: sb2-fn-{{PROJECT_NAME}}
 
 volumes:
   storage-{{PROJECT_NAME}}:
