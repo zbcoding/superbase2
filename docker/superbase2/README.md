@@ -143,7 +143,7 @@ Coolify expects a single compose file — it does not support the multi-file `-f
    ```
    Copy the entire output and paste it in one go — Coolify reads `KEY=value` lines and ignores `#` comment lines. All secrets are freshly generated. Fill in manually:
    - `SUPABASE_PUBLIC_URL` — your Kong domain (set this after step 7, then save). Open Studio through exactly this URL: Studio rejects writes from any other origin with a 403 "CSRF" error.
-   - `SITE_URL` — your application's URL. Auth emails and OAuth redirect here, for every project.
+   - `SITE_URL` and `ADDITIONAL_REDIRECT_URLS` — the sites your users come back to after auth emails and OAuth logins, shared by every project. Not the Supabase domain. See [Auth redirects](#auth-redirects-site_url-and-additional_redirect_urls).
    - `DASHBOARD_PASSWORD` — change to a strong password.
    - SMTP (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_ADMIN_EMAIL`) — the stack has no mail server, so email signup and auth emails fail until this is set (or set `ENABLE_EMAIL_AUTOCONFIRM=true`).
 
@@ -332,6 +332,31 @@ const supabase = createClient(
 )
 ```
 
+### Auth redirects (`SITE_URL` and `ADDITIONAL_REDIRECT_URLS`)
+
+These two settings decide where users land after following an auth link or callback: email confirmation, magic links, password reset, invites and OAuth logins. They are stack-wide: the main project and every SB2 project read the same values.
+
+- `SITE_URL` — one URL, the fallback. Use your main app's address, **not** `SUPABASE_PUBLIC_URL`: that is Kong, whose root is the Studio dashboard.
+- `ADDITIONAL_REDIRECT_URLS` — comma-separated list of every other site allowed as a redirect target. `*` matches one hostname label and `**` any path.
+
+```
+SITE_URL=https://vrsite.example.com
+ADDITIONAL_REDIRECT_URLS=https://*.example.com/**,https://vr.test.com/**,http://localhost:*/**
+```
+
+Each site passes its own address as the redirect, so its users return to it:
+
+```js
+await supabase.auth.signUp({ email, password, options: { emailRedirectTo: `${location.origin}/welcome` } })
+await supabase.auth.resetPasswordForEmail(email, { redirectTo: `${location.origin}/reset` })
+await supabase.auth.signInWithOAuth({ provider: 'github', options: { redirectTo: location.origin } })
+```
+
+- **Add a site when it uses one of those auth flows.** Sites that only query data, use storage or functions, or sign in with plain email and password don't need an entry. Kong allows CORS from any origin.
+- **A redirect that isn't on the list is silently replaced with `SITE_URL`.** A site that is missing from the list, or that doesn't pass a redirect, sends its users to `SITE_URL`.
+- **Changing either value means a redeploy** (Coolify: edit the environment variables, then redeploy). The agent's startup reconcile recreates every running project's auth container with the new values: a few seconds of auth downtime per project.
+- **The list is shared**, so any project can redirect to any listed site. That's fine when all the sites are yours.
+
 ### Per-project database credentials
 
 Each project gets its **own Postgres login role**, named after its database
@@ -445,7 +470,7 @@ The existing Studio UI components — project switcher, command palette, project
 - **Postgres sizing.** Every project opens its own connection pools (PostgREST, GoTrue, Storage, postgres-meta, Realtime, Functions) straight to the one shared cluster, and each running project's Realtime holds up to two replication slots. The Coolify compose therefore raises `max_connections` (default 300), `max_replication_slots` and `max_wal_senders` (default 40 each; the image default is 100/5/10, which runs out at about two or three projects). Override with `POSTGRES_MAX_CONNECTIONS`, `POSTGRES_MAX_REPLICATION_SLOTS`, `POSTGRES_MAX_WAL_SENDERS`. These need a database restart to apply. Memory per project is in the diagram above (idle estimates, plus an imgproxy container); size the host for the number of *running* projects.
 - **Kong API keys are per-project.** Each project gets its own consumers, API key credentials and ACL groups (`anon-<name>`, `admin-<name>`) in Kong, generated during `rebuild-kong`, so a project's keys only open that project's routes — never another project's, and never the main stack's (including its `/pg/` pg-meta route). Projects are also isolated at the JWT level (per-service JWT secrets).
 - **Logs are main-stack only.** Vector collects the main stack's containers; per-project service logs are only available through `docker logs supabase-<name>-<service>`. Studio's log explorer has no per-project scoping, so routing project logs into it would mix every project's logs together.
-- **One `SITE_URL` for all projects.** Every project's GoTrue uses the stack-wide `SITE_URL` and `ADDITIONAL_REDIRECT_URLS`. Each project's `API_EXTERNAL_URL` and email link paths are derived from `SUPABASE_PUBLIC_URL` and its ref (`/project/<ref>/auth/v1`); the stack's `API_EXTERNAL_URL` and `MAILER_URLPATHS_*` only apply to the main project.
+- **One `SITE_URL` for all projects.** Every project's GoTrue uses the stack-wide `SITE_URL` and `ADDITIONAL_REDIRECT_URLS` (see [Auth redirects](#auth-redirects-site_url-and-additional_redirect_urls)). Each project's `API_EXTERNAL_URL` and email link paths are derived from `SUPABASE_PUBLIC_URL` and its ref (`/project/<ref>/auth/v1`); the stack's `API_EXTERNAL_URL` and `MAILER_URLPATHS_*` only apply to the main project.
 - **Untested at scale.** This has been tested with a handful of projects. Running 50+ projects on one instance is uncharted territory.
 - **Database passwords are generated, not chosen.** `rotate-keys` mints a new random password; there is no way to set a specific one.
 
